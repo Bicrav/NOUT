@@ -50,7 +50,3 @@ lucky-imaging module for the **Moon & Sun** (sub-pixel align + multi-scale sharp
   set the camera to **PC Remote / PTP** mode.
 - *Frequent disconnects (Sony)* → raise the **Stability pause**, use a short quality USB
   cable, battery instead of USB power, turn off in-camera Wi-Fi/LENR.
-
-## License
-
-MIT — see `LICENSE` (replace `<YOUR NAME>` with yours).
