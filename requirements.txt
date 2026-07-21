@@ -1,0 +1,12 @@
+# NOUT — Python dependencies (installed into a local .venv by install.command)
+PySide6
+numpy
+opencv-python-headless
+pyqtgraph
+astropy
+rawpy
+exifread
+sgp4
+cairosvg
+gphoto2                                   # Python binding; needs libgphoto2 (Homebrew)
+pyobjc-framework-CoreLocation; sys_platform == "darwin"   # macOS location services
