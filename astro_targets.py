@@ -22,14 +22,14 @@ Dépendances :
 
 Exemples :
     # Saint-Paul-lez-Durance, cette nuit, objectif 200 mm :
-    python astro_targets.py --lat 43.694 --lon 5.737 --focal 200
+    python astro_targets.py --lat 48.8566 --lon 2.3522 --focal 200
 
     # une date précise, top 30 cibles, hauteur mini 25° :
-    python astro_targets.py --lat 43.694 --lon 5.737 --date 2026-08-15 \
+    python astro_targets.py --lat 48.8566 --lon 2.3522 --date 2026-08-15 \
                             --focal 135 --min-alt 25 --limit 30
 
 API (pour l'intégrer dans l'appli) :
-    site = Site(lat=43.694, lon=5.737, height=300, name="Cadarache")
+    site = Site(lat=48.8566, lon=2.3522, height=300, name="Site")
     night = night_window(site, when=date.today())
     recos = plan(site, when=date.today(), focal_mm=200, min_alt=30, limit=20)
 """
@@ -325,7 +325,7 @@ class Reco:
     moon_sep: float
     fits: object
     score: float
-    moon_av: int = 100        # Moon-avoidance score 0..100 (100 = no interference)
+    clear_h: float = 0.0         # hours tonight above min_alt AND above the local horizon
 
 
 def _target_track(target, site, window, step_min=2):
@@ -337,8 +337,18 @@ def _target_track(target, site, window, step_min=2):
     return float(alt[k]), times[k], alt
 
 
+def horizon_alt(profile, az_deg):
+    """Local horizon height (deg) at azimuth(s), from a profile sampled every 2°
+    (180 values, az 0, 2, … 358). None -> flat horizon."""
+    if profile is None:
+        return np.zeros_like(np.asarray(az_deg, float))
+    pr = list(profile)
+    return np.interp(np.asarray(az_deg, float) % 360.0,
+                     np.arange(0.0, 362.0, 2.0)[:len(pr) + 1], pr + [pr[0]])
+
+
 def plan(site, when, focal_mm=200, min_alt=30.0, limit=20,
-         catalog=None, include_planets=True, max_mag=None):
+         catalog=None, include_planets=True, max_mag=None, horizon=None):
     """Renvoie les meilleures cibles pour la nuit, triées par score décroissant.
     Transformation alt-az vectorisée (toutes les cibles × tous les instants en
     un seul appel) -> ~1 s au lieu de plusieurs dizaines."""
@@ -376,41 +386,40 @@ def plan(site, when, focal_mm=200, min_alt=30.0, limit=20,
     dec1d = u.Quantity([t.coord.dec for t in targets])
     coords1d = SkyCoord(ra=ra1d, dec=dec1d, frame="icrs")
     coords = coords1d[:, np.newaxis]                                    # (M, 1)
-    alt = coords.transform_to(frame).alt.deg                            # (M, N)
+    aa = coords.transform_to(frame)
+    alt = aa.alt.deg                                                    # (M, N)
+    # usable = high enough AND not behind the trees / house of the local horizon
+    ok = (alt >= min_alt) & (alt > horizon_alt(horizon, aa.az.deg))
+    step_h = span / max(n - 1, 1) / 60.0
     seps = coords1d.separation(moon_icrs).deg                           # (M,) vectorisé
 
     recos = []
     for i, tgt in enumerate(targets):
         k = int(np.argmax(alt[i]))
         max_alt = float(alt[i, k])
-        if max_alt < min_alt:
-            continue
+        clear_h = float(ok[i].sum()) * step_h
+        if max_alt < min_alt or (horizon is not None and clear_h <= 0):
+            continue                     # never usable tonight (too low, or hidden)
         sep = float(seps[i])
 
         # score : hauteur + bonus éclat + bonus taille (grand champ) - pénalité Lune.
-        # La Lune ne gêne que lorsqu'elle est levée ; son rayon d'influence grandit
-        # avec la phase (~30° en croissant, ~100° en pleine Lune) et son éclat dépend
-        # aussi de sa hauteur (une Lune basse gêne moins).
-        moon_factor = 0.0
-        if moon["alt"] > 0:
-            illum = float(moon["illum"])
-            radius = 30.0 + 70.0 * illum
-            if sep < radius:
-                closeness = (radius - sep) / radius
-                altw = min(1.0, moon["alt"] / 40.0)
-                moon_factor = closeness * illum * altw
-        moon_pen = moon_factor * 60.0
-        moon_av = int(round(100.0 * (1.0 - moon_factor)))
+        # mag inconnue => traitée comme faible (12) pour ne pas remonter en tête.
+        moon_pen = 0.0
+        if moon["illum"] > 0.25 and moon["alt"] > 0 and sep < 45:
+            moon_pen = (45 - sep) * moon["illum"] * 0.8
         mag = tgt.mag if not math.isnan(tgt.mag) else 12.0
         size_bonus = min(tgt.size_arcmin, 60.0) / 60.0 * 12.0
         score = max_alt + size_bonus - moon_pen - 1.2 * max(mag, 0)
+        if horizon is not None:          # time in the clear matters as much as height
+            score = float(alt[i][ok[i]].max()) + size_bonus - moon_pen \
+                - 1.2 * max(mag, 0) + 3.0 * min(clear_h, 4.0)
 
         recos.append(Reco(
             target=tgt, max_alt=max_alt,
             transit_local=_to_local(times[k], site),
             alt_now_window=max_alt, moon_sep=sep,
             fits=fits_in_frame(tgt.size_arcmin, focal_mm) if tgt.size_arcmin else None,
-            score=score, moon_av=moon_av))
+            score=score, clear_h=clear_h))
 
     recos.sort(key=lambda r: r.score, reverse=True)
     return night, recos[:limit]

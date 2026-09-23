@@ -1,52 +1,92 @@
 # NOUT
 
-Tethered capture and live astrophotography for **macOS** — built around a Sony camera
-but works with most cameras supported by gphoto2.
+A macOS app for deep-sky astrophotography with a tethered camera and a star tracker.
+It drives the camera, stacks the exposures as they arrive, and shows the target
+building up on screen — close to what an electronic telescope does, but with your own
+camera and your own optics.
 
-Live view with focus assist (HFR), intervalometer, live stacking (calibration, gradient
-removal, Siril-style auto-stretch), plate-solving, sky map with target GoTo, mount control
-(Star Adventurer 2i and HEQ-5 Pro over Wi-Fi) with dithering, session automation, and a
-lucky-imaging module for the **Moon & Sun** (sub-pixel align + multi-scale sharpening).
+Named after Nut, the Egyptian sky goddess arching over the world.
 
-## Requirements
+## What it does
 
-- macOS
-- A camera supported by [gphoto2](http://www.gphoto.org/proj/libgphoto2/support.php),
-  connected by USB
-- [Homebrew](https://brew.sh) (the installer uses it for the native dependencies)
+**Capture** — tethered control of the camera over USB (libgphoto2): ISO, shutter,
+aperture, single shots, intervalometer, bulb sequences, burst mode. Live view with a
+red centre reticle, focus aids and a sky-level exposure indicator.
+
+**Live stacking** — every exposure is corrected for hot pixels (no darks needed),
+registered on the stars (sub-pixel: 0.03 px measured), weighted by its own quality and
+integrated into a running mean, with kappa-sigma rejection. Frames spoiled by cloud,
+a satellite trail or lost tracking are dropped.
+
+**Observation look** — the display of the stack is processed like a smart telescope
+would: sky model that ignores extended objects, neutral background, star-based colour
+calibration, green removal (SCNR), colour-preserving arcsinh stretch that does not burn
+galaxy cores, noise reduction, gentle local contrast. GraXpert is used for the sky
+model when it is installed.
+
+**Public view** — the picture full screen on a second display, with the target's name
+and distance, for visitors.
+
+**Mount** — Star Adventurer 2i over Wi-Fi: tracking rates (sidereal, lunar, solar,
+planetary), motorised slews on the RA axis, dithering between exposures, and a manual
+GoTo that computes both axis angles for a two-axis rig read from engraved dials.
+
+**Sky map and planning** — all-sky and framing views, constellations, planets, comets,
+the ISS, survey images as background, a target list ranked for the night with Moon
+avoidance and framing fit, and a local horizon you draw yourself (trees, houses) that
+is taken into account when ranking targets.
+
+**Plate solving** — astrometry.net, local or online, with catalogue objects drawn over
+the stack once the field is identified.
+
+**Moon and planets** — lucky imaging: the sharpest frames are kept, aligned sub-pixel
+and stacked, with multi-scale sharpening. Video can come from the camera's live view,
+from an in-camera movie, or from an HDMI capture card recorded uncompressed to SER.
+
+## Hardware it was built against
+
+- Sony α7 II over USB (any camera libgphoto2 supports should work, with fewer
+  guarantees)
+- Sky-Watcher Star Adventurer 2i Wi-Fi
+- Evostar 72ED refractor, with and without reducer or Barlow
 
 ## Install
 
-1. Get the code: green **Code** button → **Download ZIP**, then unzip — or, better,
-   `git clone` it so you can update in one click.
-2. Double-click **`install.command`**.
-   - If macOS blocks it ("unidentified developer"): right-click → **Open** → **Open**.
-   - It installs the native tools (gphoto2, cairo) and a self-contained Python environment.
-     Nothing touches your system Python.
-3. Double-click **`run.command`** to launch NOUT.
+Clone this repository, then double-click **install.command** (it uses Homebrew for
+libgphoto2 and builds a local `.venv`). Start the app with **run.command**, and update
+it later with **update.command**.
 
-## Update
+By hand:
 
-- **Cloned with git:** double-click **`update.command`** — or in the app, **Help → Check for
-  updates**.
-- **Downloaded the ZIP:** download the latest ZIP again and re-run `install.command`.
+```bash
+brew install libgphoto2
+python3 -m venv .venv
+./.venv/bin/pip install -r requirements.txt
+./.venv/bin/python sony_tether_focus.py
+```
 
-## Optional
+`--simulate` runs the whole app without a camera, which is how most of it is tested.
 
-- **GraXpert** (AI gradient removal): install the GraXpert app; NOUT detects it automatically.
-- **Full LDN catalog**: run `python3 fetch_ldn.py` once to download every Lynds dark nebula
-  into `catalog_ldn.csv` (appears on the Sky Map and preview overlay).
+Optional: [GraXpert](https://graxpert.com) for AI background extraction,
+[Siril](https://siril.org) for final processing, and the astrometry.net index files if
+you want to plate-solve offline.
 
-## Quick start — the Moon (best quality on Sony)
+On macOS the app can also be packaged as a `.app` bundle; `packaging/` holds the
+launcher script and the `Info.plist` used for that, including the camera and location
+usage descriptions macOS requires.
 
-1. Point at the Moon, short exposure (1/250–1/500 s), low ISO.
-2. Shooting tab → intervalometer: Pause 0, **Stability pause 2 s**, ~120 shots → Start.
-3. 🪐 Planetary → **Lucky-stack full-res PHOTOS** → pick the folder → Save.
+## Safety
 
-## Troubleshooting
+Never point the camera, the finder or the polar scope at the Sun without a certified
+full-aperture solar filter in front of the objective. It destroys the sensor, and your
+eyes.
 
-- *"gphoto2 module not installed"* → re-run `install.command`.
-- *Camera not detected* → close other apps using it (Imaging Edge, Photos), replug USB,
-  set the camera to **PC Remote / PTP** mode.
-- *Frequent disconnects (Sony)* → raise the **Stability pause**, use a short quality USB
-  cable, battery instead of USB power, turn off in-camera Wi-Fi/LENR.
+## State of the project
+
+This is a personal tool, written for one rig and one observer, and it grows with what
+that rig needs. Expect rough edges elsewhere. Settings, target lists and horizon
+profiles are stored in the macOS preferences of the app, not in this repository.
+
+## Licence
+
+MIT — see [LICENSE](LICENSE). Use it, change it, share it.

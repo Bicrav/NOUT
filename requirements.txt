@@ -10,3 +10,4 @@ sgp4
 cairosvg
 gphoto2                                   # Python binding; needs libgphoto2 (Homebrew)
 pyobjc-framework-CoreLocation; sys_platform == "darwin"   # macOS location services
+astroquery                                # optional: catalogue lookups

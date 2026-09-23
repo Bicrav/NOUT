@@ -143,6 +143,15 @@ def _load_search_catalog(path):
                     if name:
                         exist["name"] = name
                     exist["name_fr"] = name_fr
+                    # Honour curated coordinates here too, or the search box would
+                    # send you somewhere the map does not draw the object: the
+                    # quintet's catalogue entry is its foreground galaxy, a minute
+                    # south of the group everyone actually frames.
+                    for src, dst in (("ra_deg", "ra"), ("dec_deg", "dec")):
+                        try:
+                            exist[dst] = float(row.get(src) or "")
+                        except ValueError:
+                            pass
                 else:
                     try:
                         ra = float(row["ra_deg"]); dec = float(row["dec_deg"])
@@ -154,11 +163,32 @@ def _load_search_catalog(path):
     return out
 
 
+def _curated_names(path):
+    """The hand-written common-name list beside the catalogue, keyed by id."""
+    out = {}
+    npath = os.path.join(os.path.dirname(path) or ".", "dso_names.csv")
+    if not os.path.exists(npath):
+        return out
+    with open(npath, newline="") as f:
+        for row in csv.DictReader(f):
+            key = (row.get("id") or "").upper().replace(" ", "")
+            if key:
+                out[key] = row
+    return out
+
+
 def _load_dso(path, max_mag=10.5, min_size=6.0):
-    """DSO for display: keep bright OR large objects (caps the count for speed)."""
+    """DSO for display: bright OR large objects, plus everything that was given a
+    common name.
+
+    The magnitude cut exists to keep thousands of anonymous galaxies off the map,
+    but it also hid targets people actually go after: Stephan's Quintet is 13th
+    magnitude and 3.5' across, so it never appeared even at 1050 mm where it is a
+    fine subject. Anything curated enough to have a name is worth drawing."""
     out = []
     if not os.path.exists(path):
         return out
+    named = _curated_names(path)
     with open(path, newline="") as f:
         for row in csv.DictReader(f):
             try:
@@ -168,12 +198,29 @@ def _load_dso(path, max_mag=10.5, min_size=6.0):
                 continue
             mag = float(row["mag"]) if row.get("mag") else float("nan")
             size = float(row["size_arcmin"]) if row.get("size_arcmin") else 0.0
+            cur = named.get(row["id"].upper().replace(" ", ""))
             keep = (not math.isnan(mag) and mag <= max_mag) or size >= min_size
-            if not keep:
+            if not (keep or cur):
                 continue
-            out.append({"id": row["id"], "name": row.get("name") or row["id"],
-                        "type": row.get("type") or "", "ra": ra, "dec": dec,
-                        "mag": mag, "size": size})
+            name = row.get("name") or row["id"]
+            typ = row.get("type") or ""
+            if cur:                         # the curated row wins where it is filled
+                name = (cur.get("name") or "").strip() or name
+                typ = (cur.get("type") or "").strip() or typ
+                for key, setter in (("ra_deg", "ra"), ("dec_deg", "dec"),
+                                    ("size_arcmin", "size")):
+                    try:
+                        val = float(cur.get(key) or "")
+                    except ValueError:
+                        continue
+                    if setter == "ra":
+                        ra = val
+                    elif setter == "dec":
+                        dec = val
+                    else:
+                        size = val
+            out.append({"id": row["id"], "name": name, "type": typ,
+                        "ra": ra, "dec": dec, "mag": mag, "size": size})
     return out
 
 
@@ -433,10 +480,11 @@ class SkyMap(QtWidgets.QWidget):
             + [{"id": x["id"], "name": x["name"], "ra": x["ra"], "dec": x["dec"]}
                for x in _EXTRA_DSO]
         # state
-        self.mode = "framing"
+        self.mode = "allsky"            # the whole sky as it stands: the default view
         self.center_ra = 83.8         # Orion by default (M42 area)
         self.center_dec = -5.4
-        self.target_name = "M42"
+        self.target_name = ""           # nothing chosen yet: stay neutral, draw no target
+        self.has_target = False
         self.view_fov = 25.0          # degrees across the widget (framing)
         self.focal_mm = 135.0
         self.cam_angle = 0.0          # camera rotation (deg), 0 = aligned to RA/Dec
@@ -451,8 +499,8 @@ class SkyMap(QtWidgets.QWidget):
         self.show_constnames = True
         self.show_names = True
         # all-sky / horizon view (Stellarium-like)
-        self.lat = 43.694
-        self.lon = 5.737
+        self.lat = 48.8566
+        self.lon = 2.3522
         self.dt_utc = None            # datetime in UTC
         self._planets = []            # [(name, ra, dec, color)]
         self.view_az = 180.0          # looking azimuth (deg from N, S=180)
@@ -465,6 +513,7 @@ class SkyMap(QtWidgets.QWidget):
         # session goal (the object to find) shown alongside the current pointing
         self.goal_ra = 0.0; self.goal_dec = 0.0
         self.goal_name = ""; self.show_goal = False
+        self.local_horizon = None
         # interaction
         self._pan_offset = QtCore.QPointF(0, 0)
         self._drag = None
@@ -474,8 +523,18 @@ class SkyMap(QtWidgets.QWidget):
         self.setFocusPolicy(Qt.StrongFocus)
 
     # -- configuration -----------------------------------------------------
+    def _body_now(self, name, ra_deg, dec_deg):
+        """For the Moon/planets, where they are at the time the map shows."""
+        body = self._body_of(name)
+        for nm, ra, dec, _c in getattr(self, "_planets", []):
+            if nm == body:
+                return ra, dec
+        return ra_deg, dec_deg
+
     def set_target(self, name, ra_deg, dec_deg):
         self.target_name = name
+        self.has_target = True
+        ra_deg, dec_deg = self._body_now(name, ra_deg, dec_deg)
         self.center_ra = ra_deg % 360.0
         self.center_dec = dec_deg
         self.update()
@@ -492,6 +551,12 @@ class SkyMap(QtWidgets.QWidget):
     def set_mosaic(self, rows, cols, overlap, show):
         self.mos_rows = int(rows); self.mos_cols = int(cols)
         self.mos_overlap = float(overlap); self.show_mosaic = bool(show)
+        self.update()
+
+    def set_local_horizon(self, profile):
+        """Trees, roofs… as seen from the site: 180 heights (deg), az 0, 2 … 358. None
+        for an open horizon."""
+        self.local_horizon = list(profile) if profile else None
         self.update()
 
     def set_site(self, lat, lon):
@@ -614,7 +679,7 @@ class SkyMap(QtWidgets.QWidget):
 
     def _paint_trajectory_allsky(self, p):
         """Dashed diurnal path of the target across the sky (rise → transit → set)."""
-        if not self.show_trajectory or self.lat is None:
+        if not self.show_trajectory or self.lat is None or not self.has_target:
             return
         lat = math.radians(self.lat); dec = math.radians(self.center_dec)
         ha = np.radians(np.arange(-180.0, 180.5, 2.0))
@@ -681,6 +746,7 @@ class SkyMap(QtWidgets.QWidget):
                 p.drawText(QtCore.QPointF(float(sx[0]) + 5, float(sy[0]) - 4), s["name"])
 
     def set_goal(self, name, ra_deg, dec_deg):
+        ra_deg, dec_deg = self._body_now(name, ra_deg, dec_deg)
         self.goal_name = name; self.goal_ra = ra_deg % 360.0; self.goal_dec = dec_deg
         self.show_goal = True; self.update()
 
@@ -787,6 +853,7 @@ class SkyMap(QtWidgets.QWidget):
                 self._planets.append((nm, float(b.ra.deg), float(b.dec.deg), col))
         except Exception:           # noqa: BLE001
             self._planets = []
+        self._follow_bodies()
         # comets (offline two-body propagation of orbital elements)
         self._comet_pos = []
         if self.comets and self.dt_utc is not None:
@@ -813,6 +880,40 @@ class SkyMap(QtWidgets.QWidget):
                     self._iss_pos = (ra, dec, alt)
             except Exception:       # noqa: BLE001
                 self._iss_pos = None
+
+    # Names a solar-system target may carry (sky map search, targets list, French UI).
+    _BODY_ALIASES = {"sun": "Sun", "soleil": "Sun", "moon": "Moon", "lune": "Moon",
+                     "mercury": "Mercury", "mercure": "Mercury", "venus": "Venus",
+                     "vénus": "Venus", "mars": "Mars", "jupiter": "Jupiter",
+                     "saturn": "Saturn", "saturne": "Saturn", "uranus": "Uranus",
+                     "neptune": "Neptune"}
+
+    def _body_of(self, name):
+        key = (name or "").strip().lower()
+        for pre in ("🎯", "the "):
+            key = key.replace(pre, "").strip()
+        return self._BODY_ALIASES.get(key)
+
+    def _follow_bodies(self):
+        """A Moon or planet target moves against the stars (the Moon ~0.5° an hour).
+        Its position was frozen when it was picked, so scrolling the time slid the
+        Moon out of its own camera frame. Carry the frame (and the goal frame) along
+        with the body, keeping any offset the user panned in."""
+        pos = {nm: (ra, dec) for nm, ra, dec, _c in self._planets}
+        prev = getattr(self, "_body_prev", {})
+        for attr_name, ra_a, dec_a in (("target_name", "center_ra", "center_dec"),
+                                       ("goal_name", "goal_ra", "goal_dec")):
+            body = self._body_of(getattr(self, attr_name, ""))
+            if body is None or body not in pos:
+                continue
+            new = pos[body]
+            old = prev.get(body)
+            if old is None:
+                continue                  # first computation: nothing moved yet
+            dra = ((new[0] - old[0] + 540.0) % 360.0) - 180.0
+            setattr(self, ra_a, (getattr(self, ra_a) + dra) % 360.0)
+            setattr(self, dec_a, max(-90.0, min(90.0, getattr(self, dec_a) + new[1] - old[1])))
+        self._body_prev = pos
 
     # -- projection helpers ------------------------------------------------
     def _scale_framing(self):
@@ -1345,7 +1446,7 @@ class SkyMap(QtWidgets.QWidget):
         # target trajectory (diurnal arc) + marker
         self._paint_trajectory_allsky(p)
         sx, sy, vis, alt = self._radec_h(self.center_ra, self.center_dec, lst)
-        if vis[0] and alt[0] > 0:
+        if self.has_target and vis[0] and alt[0] > 0:
             p.setPen(QtGui.QPen(QtGui.QColor(255, 90, 90), 2)); p.setBrush(Qt.NoBrush)
             p.drawEllipse(QtCore.QPointF(float(sx[0]), float(sy[0])), 9, 9)
             p.setPen(QtGui.QColor(255, 150, 150))
@@ -1419,12 +1520,42 @@ class SkyMap(QtWidgets.QWidget):
         gg.setColorAt(0.0, QtGui.QColor(46, 50, 44))
         gg.setColorAt(1.0, QtGui.QColor(10, 12, 10))
         p.fillPath(path, gg)
+        self._paint_local_horizon(p)
         # marked horizon line
         p.setPen(QtGui.QPen(QtGui.QColor(150, 200, 235), 2))
         for i in range(len(pts) - 1):
             a = QtCore.QPointF(*pts[i]); b = QtCore.QPointF(*pts[i + 1])
             if (a - b).manhattanLength() < 400:
                 p.drawLine(a, b)
+
+    def _paint_local_horizon(self, p):
+        """The saved skyline (trees, the neighbour's house) as a dark silhouette."""
+        prof = getattr(self, "local_horizon", None)
+        if not prof or max(prof) <= 0:
+            return
+        azs = np.linspace(self.view_az - 175, self.view_az + 175, 351)
+        pr = list(prof)
+        hz = np.interp(azs % 360.0, np.arange(0.0, 362.0, 2.0)[:len(pr) + 1], pr + [pr[0]])
+        tx, ty, tv = self._project_horizon(hz, azs)
+        bx, by, bv = self._project_horizon(np.zeros_like(azs), azs)
+        path = QtGui.QPainterPath(); edge = QtGui.QPainterPath()
+        started = False
+        for i in range(len(azs)):
+            if not (tv[i] and bv[i]):
+                continue
+            if not started:
+                path.moveTo(float(bx[i]), float(by[i])); edge.moveTo(float(tx[i]), float(ty[i]))
+                started = True
+            path.lineTo(float(tx[i]), float(ty[i])); edge.lineTo(float(tx[i]), float(ty[i]))
+        for i in range(len(azs) - 1, -1, -1):
+            if tv[i] and bv[i]:
+                path.lineTo(float(bx[i]), float(by[i]))
+        if not started:
+            return
+        path.closeSubpath()
+        p.fillPath(path, QtGui.QColor(12, 16, 12, 235))
+        p.setPen(QtGui.QPen(QtGui.QColor(90, 120, 90), 1.5)); p.setBrush(Qt.NoBrush)
+        p.drawPath(edge)
 
     def _horizon_cardinals(self, p):
         fb = QtGui.QFont(); fb.setPointSize(11); fb.setBold(True); p.setFont(fb)
