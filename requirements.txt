@@ -1,4 +1,4 @@
-# NOUT — Python dependencies (installed into a local .venv by install.command)
+# NOUT — Python dependencies.  python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 PySide6
 numpy
 opencv-python-headless
@@ -7,7 +7,10 @@ astropy
 rawpy
 exifread
 sgp4
-cairosvg
-gphoto2                                   # Python binding; needs libgphoto2 (Homebrew)
-pyobjc-framework-CoreLocation; sys_platform == "darwin"   # macOS location services
-astroquery                                # optional: catalogue lookups
+
+# Tethered capture. Needs libgphoto2 (brew install libgphoto2 / apt install libgphoto2-dev).
+# libgphoto2 has no Windows build: on Windows everything else works, capture does not.
+gphoto2; sys_platform != "win32"
+
+# macOS location services (the "Locate me" button); harmless to omit elsewhere.
+pyobjc-framework-CoreLocation; sys_platform == "darwin"

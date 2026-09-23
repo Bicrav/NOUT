@@ -39,12 +39,14 @@ LAUNCH:
 
 import argparse
 import csv
+import glob
 import json
 import math
 import os
 import platform
 import queue
 import re
+import shutil
 import signal
 import subprocess
 import sys
@@ -363,13 +365,24 @@ def _find_graxpert():
     """Locate a GraXpert executable (macOS app bundle or on PATH)."""
     import glob
     import shutil
-    cands = ["/Applications/GraXpert.app/Contents/MacOS/GraXpert",
-             os.path.expanduser("~/Applications/GraXpert.app/Contents/MacOS/GraXpert")]
-    # the executable inside the bundle may have a suffix — take whatever is in MacOS/
-    for base in ("/Applications/GraXpert.app/Contents/MacOS",
-                 os.path.expanduser("~/Applications/GraXpert.app/Contents/MacOS")):
-        cands += sorted(glob.glob(os.path.join(base, "*")))
-    cands += [shutil.which("graxpert"), shutil.which("GraXpert")]
+    cands = []
+    if sys.platform == "darwin":
+        # the executable inside the bundle may have a suffix — take whatever is in MacOS/
+        for base in ("/Applications/GraXpert.app/Contents/MacOS",
+                     os.path.expanduser("~/Applications/GraXpert.app/Contents/MacOS")):
+            cands.append(os.path.join(base, "GraXpert"))
+            cands += sorted(glob.glob(os.path.join(base, "*")))
+    elif os.name == "nt":
+        for base in (os.environ.get("ProgramFiles", r"C:\Program Files"),
+                     os.environ.get("LOCALAPPDATA", ""), os.environ.get("ProgramW6432", "")):
+            if base:
+                cands += [os.path.join(base, "GraXpert", "GraXpert.exe"),
+                          os.path.join(base, "Programs", "GraXpert", "GraXpert.exe")]
+    else:
+        cands += ["/usr/bin/graxpert", "/usr/local/bin/graxpert", "/opt/GraXpert/GraXpert"]
+        cands += sorted(glob.glob(os.path.expanduser("~/Applications/GraXpert*")))
+        cands += sorted(glob.glob(os.path.expanduser("~/.local/bin/graxpert*")))
+    cands += [shutil.which("graxpert"), shutil.which("GraXpert"), shutil.which("GraXpert.exe")]
     for c in cands:
         if c and os.path.isfile(c) and os.access(c, os.X_OK):
             return c
@@ -3932,27 +3945,68 @@ def open_video_frames(path):
     return n, gen
 
 
-def list_video_devices():
-    """[(index, name)] of the Mac's video inputs, as AVFoundation numbers them.
-    Screens are left out: OpenCV cannot open them by index anyway."""
-    if platform.system() != "Darwin":
-        return [(i, "Video device {}".format(i)) for i in range(4)]
+def video_backend():
+    """The OpenCV capture backend that actually works on this system."""
+    if sys.platform == "darwin":
+        return cv2.CAP_AVFOUNDATION
+    if os.name == "nt":
+        return cv2.CAP_DSHOW              # DirectShow: what UVC cards expose on Windows
+    return cv2.CAP_V4L2                   # Linux
+
+
+def _ffmpeg_devices(fmt, dummy):
+    """Device names as ffmpeg lists them for an input format (macOS / Windows)."""
     try:
-        out = subprocess.run(["ffmpeg", "-hide_banner", "-f", "avfoundation",
-                              "-list_devices", "true", "-i", ""],
+        out = subprocess.run(["ffmpeg", "-hide_banner", "-f", fmt,
+                              "-list_devices", "true", "-i", dummy],
                              capture_output=True, text=True, timeout=8).stderr
-    except Exception:                   # noqa: BLE001 - no ffmpeg: offer bare indexes
-        return [(i, "Video device {}".format(i)) for i in range(4)]
-    devs, in_video = [], False
-    for line in out.splitlines():
-        if "video devices" in line:
-            in_video = True; continue
-        if "audio devices" in line:
-            break
-        m = re.search(r"\[(\d+)\]\s+(.+)$", line)
-        if in_video and m and "capture screen" not in m.group(2).lower():
-            devs.append((int(m.group(1)), m.group(2).strip()))
-    return devs
+    except Exception:                   # noqa: BLE001 - no ffmpeg
+        return None
+    return out
+
+
+def list_video_devices():
+    """[(index, name)] of this machine's video inputs, numbered the way the capture
+    backend numbers them. Falls back to bare indexes when the names cannot be read."""
+    plain = [(i, "Video device {}".format(i)) for i in range(4)]
+    if sys.platform == "darwin":
+        out = _ffmpeg_devices("avfoundation", "")
+        if out is None:
+            return plain
+        devs, in_video = [], False
+        for line in out.splitlines():
+            if "video devices" in line:
+                in_video = True; continue
+            if "audio devices" in line:
+                break
+            m = re.search(r"\[(\d+)\]\s+(.+)$", line)
+            if in_video and m and "capture screen" not in m.group(2).lower():
+                devs.append((int(m.group(1)), m.group(2).strip()))
+        return devs or plain
+    if os.name == "nt":
+        out = _ffmpeg_devices("dshow", "dummy")
+        if out is None:
+            return plain
+        devs = []
+        for line in out.splitlines():
+            m = re.search(r'"(.+)"\s*\(video\)', line)
+            if m:
+                devs.append((len(devs), m.group(1).strip()))
+        return devs or plain
+    devs = []                                        # Linux: /dev/videoN + its name
+    for path in sorted(glob.glob("/dev/video*")):
+        try:
+            idx = int(re.sub(r"\D", "", os.path.basename(path)))
+        except ValueError:
+            continue
+        name = "Video device {}".format(idx)
+        try:
+            with open("/sys/class/video4linux/video{}/name".format(idx)) as f:
+                name = f.read().strip() or name
+        except OSError:
+            pass
+        devs.append((idx, name))
+    return devs or plain
 
 
 def _is_builtin_camera(name):
@@ -4005,7 +4059,7 @@ class HdmiSource(QtCore.QThread):
 
     def _open(self):
         if isinstance(self.source, int):
-            cap = cv2.VideoCapture(self.source, cv2.CAP_AVFOUNDATION)
+            cap = cv2.VideoCapture(self.source, video_backend())
             if cap.isOpened():
                 cap.set(cv2.CAP_PROP_FRAME_WIDTH, self.size[0])
                 cap.set(cv2.CAP_PROP_FRAME_HEIGHT, self.size[1])
@@ -5876,7 +5930,9 @@ _THEME_EVA_NIGHT = dict(
 def _indicator_icons(p):
     """Checkmark and combo/spin arrows as small PNGs (QSS can only take images).
     Cached per colour, so switching day/night just points at other files."""
-    d = os.path.join(os.path.expanduser("~/Library/Caches"), "NOUT", "qss")
+    base = QtCore.QStandardPaths.writableLocation(
+        QtCore.QStandardPaths.StandardLocation.CacheLocation) or os.path.expanduser("~/.cache")
+    d = os.path.join(base, "NOUT", "qss")
     os.makedirs(d, exist_ok=True)
     out = {}
 
@@ -7071,7 +7127,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.awake_mode.addItem("☕ Awake: always", "always")
         self.awake_mode.addItem("☕ Awake: during capture", "capture")
         self.awake_mode.addItem("☕ Awake: off", "off")
-        self.awake_mode.setToolTip("Prevent the Mac sleeping/locking (macOS caffeinate).")
+        self.awake_mode.setToolTip("Keep the machine awake while capturing "
+                                   "(caffeinate, systemd-inhibit, or the Windows "
+                                   "execution-state flags).")
         _i = self.awake_mode.findData(_s.value("keep_awake_mode", "always", type=str))
         self.awake_mode.setCurrentIndex(max(0, _i))
         self._caffeinate = None
@@ -11728,7 +11786,30 @@ class MainWindow(QtWidgets.QMainWindow):
         self.worker.post("set_flats", on=bool(on), flats_dir=self._flats_dir())
 
     def _start_caffeinate(self):
-        """Prevent macOS sleep/display-sleep/lock while NOUT runs (via 'caffeinate')."""
+        """Keep the machine awake while NOUT runs.
+
+        macOS: 'caffeinate'. Linux: 'systemd-inhibit'. Windows: the thread execution
+        state flags, which is how an application says 'I am busy' there."""
+        if os.name == "nt":
+            try:
+                import ctypes
+                # ES_CONTINUOUS | ES_SYSTEM_REQUIRED | ES_DISPLAY_REQUIRED
+                ctypes.windll.kernel32.SetThreadExecutionState(0x80000000 | 0x00000001 | 0x00000002)
+                self._caffeinate = "win"
+            except Exception:           # noqa: BLE001
+                self._caffeinate = None
+            return
+        if sys.platform.startswith("linux"):
+            if self._caffeinate is not None and getattr(self._caffeinate, "poll", lambda: 0)() is None:
+                return
+            try:
+                self._caffeinate = subprocess.Popen(
+                    ["systemd-inhibit", "--what=idle:sleep:handle-lid-switch",
+                     "--why=NOUT is capturing", "sleep", "infinity"],
+                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception:           # noqa: BLE001
+                self._caffeinate = None
+            return
         if sys.platform != "darwin":
             return
         if self._caffeinate is not None and self._caffeinate.poll() is None:
@@ -11743,6 +11824,14 @@ class MainWindow(QtWidgets.QMainWindow):
             self._caffeinate = None
 
     def _stop_caffeinate(self):
+        if self._caffeinate == "win":
+            try:
+                import ctypes
+                ctypes.windll.kernel32.SetThreadExecutionState(0x80000000)   # ES_CONTINUOUS
+            except Exception:           # noqa: BLE001
+                pass
+            self._caffeinate = None
+            return
         if self._caffeinate is not None:
             try:
                 self._caffeinate.terminate()
@@ -13559,11 +13648,24 @@ class MainWindow(QtWidgets.QMainWindow):
         if not getattr(self, "chk_notify", None) or not self.chk_notify.isChecked():
             return
         try:
-            subprocess.Popen(["osascript", "-e",
-                              'display notification "{}" with title "{}" sound name "Glass"'.format(
-                                  message.replace('"', "'"), title.replace('"', "'"))])
+            if sys.platform == "darwin":
+                subprocess.Popen(["osascript", "-e",
+                                  'display notification "{}" with title "{}" sound name "Glass"'.format(
+                                      message.replace('"', "'"), title.replace('"', "'"))])
+                return
+            if sys.platform.startswith("linux") and shutil.which("notify-send"):
+                subprocess.Popen(["notify-send", title, message])
+                return
         except Exception:             # noqa: BLE001
             pass
+        try:                          # Windows, or anything without a notifier: use the tray
+            tray = getattr(self, "_tray", None)
+            if tray is None:
+                tray = self._tray = QtWidgets.QSystemTrayIcon(self.windowIcon(), self)
+                tray.show()
+            tray.showMessage(title, message, QtWidgets.QSystemTrayIcon.MessageIcon.Information, 6000)
+        except Exception:             # noqa: BLE001
+            self.statusBar().showMessage("{} — {}".format(title, message), 8000)
 
     def _open_session_folder(self):
         import subprocess
