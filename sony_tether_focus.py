@@ -2090,12 +2090,25 @@ class SkyWatcherMount:
         Wi-Fi drop does not stop the board, so after a reconnect the counter is
         still valid and an axis-1 sync must survive it. Zeroing here would throw
         that away silently and send the next GoTo somewhere absurd."""
+        # Opening the link is the one place where waiting is pointless: either the
+        # board answers or the Mac is not on its Wi-Fi. Five retries at a two-second
+        # timeout per command meant 35 s of apparent nothing before the failure showed.
+        old_to = self.sock.gettimeout()
         try:
-            self._send("e1")                            # inquire version (handshake, optional)
-        except Exception:               # noqa: BLE001
-            pass
-        self.cpr = self._unhex_lsb(self._send("a1"))    # counts per revolution (RA)
-        self.freq = self._unhex_lsb(self._send("b1"))   # timer interrupt frequency
+            self.sock.settimeout(0.8)
+            try:
+                self._send("e1", retries=1)             # version (handshake, optional)
+            except Exception:           # noqa: BLE001
+                pass
+            try:
+                self.cpr = self._unhex_lsb(self._send("a1", retries=2))   # counts / turn
+                self.freq = self._unhex_lsb(self._send("b1", retries=2))  # timer frequency
+            except Exception as e:      # noqa: BLE001
+                raise RuntimeError(
+                    "no answer from the motor board at {} — is this Mac on the mount's "
+                    "Wi-Fi network, and the mount switched on? ({})".format(self.ip, e))
+        finally:
+            self.sock.settimeout(old_to)
         if not self.cpr or not self.freq:
             raise RuntimeError("no motor-board response")
         if not preserve_position:
@@ -2480,6 +2493,27 @@ class _MountOp(QtCore.QThread):
 _LINGERING_THREADS = []
 
 
+def _save_axis1_sync(zero):
+    """Keep the axis-1 sync across restarts: it stays valid as long as the mount is
+    not switched off, and re-doing it costs a star and twenty seconds."""
+    try:
+        QtCore.QSettings("NOUT", "NOUT").setValue(
+            "axis1_sync", json.dumps({"counts": int(zero[0]), "ha": float(zero[1]),
+                                      "sign": int(zero[2]), "t": time.time()}))
+    except Exception:                   # noqa: BLE001
+        pass
+
+
+def _load_axis1_sync(max_age_h=24.0):
+    try:
+        d = json.loads(QtCore.QSettings("NOUT", "NOUT").value("axis1_sync", "", type=str))
+        if time.time() - float(d.get("t", 0)) > max_age_h * 3600:
+            return None
+        return (int(d["counts"]), float(d["ha"]), int(d["sign"]))
+    except Exception:                   # noqa: BLE001
+        return None
+
+
 def _retire_thread(op, timeout_ms=15000):
     """Wait for a worker thread, and never drop it while it is still alive."""
     if op is None:
@@ -2529,6 +2563,51 @@ class _MountQueue(QtCore.QThread):
                 self._handler(kind, kw)
             except Exception:           # noqa: BLE001  (never kill the queue)
                 pass
+
+
+class _FrameProcessor(QtCore.QThread):
+    """Decodes, measures and stacks saved frames, off the capture thread.
+
+    The camera thread only shoots and downloads; everything that takes time happens
+    here, so the interval between exposures is the exposure plus the download, not
+    the exposure plus the download plus the stack."""
+    def __init__(self, worker):
+        super().__init__()
+        self._w = worker
+        self._q = queue.Queue()
+        self._running = True
+
+    def submit(self, job):
+        self._q.put(job)
+
+    def backlog(self):
+        return self._q.qsize()
+
+    def idle(self):
+        return self._q.empty() and not getattr(self, "_busy", False)
+
+    def wait_idle(self, timeout_s=60.0):
+        end = time.monotonic() + timeout_s
+        while not self.idle() and time.monotonic() < end:
+            time.sleep(0.05)
+        return self.idle()
+
+    def stop(self):
+        self._running = False
+        self._q.put(None)
+
+    def run(self):
+        while self._running:
+            job = self._q.get()
+            if job is None:
+                break
+            self._busy = True
+            try:
+                self._w._process_frame(*job)
+            except Exception as e:      # noqa: BLE001
+                print("[NOUT] frame processing failed:", e, file=sys.stderr, flush=True)
+            finally:
+                self._busy = False
 
 
 class CameraWorker(QtCore.QThread):
@@ -2608,6 +2687,9 @@ class CameraWorker(QtCore.QThread):
         self._track_spec = None         # (body, lat, lon) for a non-sidereal rate
         self._dither_every = 4; self._dither_amp = 150.0; self._dither_settle = 4.0
         self._shots_since_dither = 0; self._dither_pos = 0.0
+        self._proc = None              # frame-processing thread (decode/measure/stack)
+        self._calibration = False      # flats/darks/bias: nothing to display or stack
+        self._stack_reset_req = False  # reset asked for while the processor is running
         self._stack_ref_gray = None
         self._stack_wpx = None
         self._stack_crop = None
@@ -2651,6 +2733,12 @@ class CameraWorker(QtCore.QThread):
     def stop(self):
         self._running = False
         self._axis1_abort = True
+        proc = getattr(self, "_proc", None)
+        if proc is not None:
+            try:
+                proc.stop()
+            except Exception:               # noqa: BLE001
+                pass
         q = getattr(self, "_mount_q", None)
         if q is not None:
             try:
@@ -2784,6 +2872,7 @@ class CameraWorker(QtCore.QThread):
                 self.msleep(60)               # intervalometer running or live view off
 
         backend.close()
+        _retire_thread(getattr(self, "_proc", None), 5000)
 
     # -- reconnection -------------------------------------------------------
     @staticmethod
@@ -2852,7 +2941,8 @@ class CameraWorker(QtCore.QThread):
             elif self._dither_mount is not None:
                 self._dither_mount.close(); self._dither_mount = None
         elif kind == "mount_connect":
-            self._mount_connect(kw.get("ip", "192.168.4.1"), kw.get("two_axis", False))
+            self._mount_connect(kw.get("ip", "192.168.4.1"), kw.get("two_axis", False),
+                                preserve=bool(kw.get("preserve")))
         elif kind == "mount_track_start":
             if self._dither_mount is None:
                 self._mount_connect(kw.get("ip", "192.168.4.1"), kw.get("two_axis", False))
@@ -2953,7 +3043,19 @@ class CameraWorker(QtCore.QThread):
             now, counts = time.monotonic(), m.get_counts(retries=0)
         except Exception:               # noqa: BLE001  (Wi-Fi hiccup: skip this sample)
             self.mount_track_state.emit(float("nan"), 0.0, 0.0)
+            # The 2i's Wi-Fi drops now and then, and a mount that stops answering is
+            # usually still tracking — it is the link that died. After ~12 s of
+            # silence, reopen it, keeping the step counter so an axis-1 sync survives.
+            self._probe_fails = getattr(self, "_probe_fails", 0) + 1
+            if self._probe_fails == 6 or (self._probe_fails > 6 and self._probe_fails % 15 == 0):
+                try:
+                    info = m.reconnect()
+                    self._probe_fails = 0
+                    self.mount_status.emit("🔄 Wi-Fi dropped — link re-opened ({})".format(info))
+                except Exception as e:  # noqa: BLE001
+                    self.mount_status.emit("⚠ Mount unreachable: {}".format(e))
             return
+        self._probe_fails = 0
         prev = getattr(self, "_track_sample", None)
         self._track_sample = (now, counts)
         if prev is None or now - prev[0] < 1.5:
@@ -3052,6 +3154,7 @@ class CameraWorker(QtCore.QThread):
                 ha = manual_goto.wrap180(ha + 180.0)
             self._axis1_ref(m)          # may move the axis; the anchor is already taken
             self._axis1_zero = (counts0, ha, m.motor_sign)
+            _save_axis1_sync(self._axis1_zero)
             self.mount_axis1_result.emit(
                 True, "Axis 1 synced on {} — encoder tied to hour angle {:+.3f}°{}. "
                       "GoTo is live.".format(
@@ -3165,14 +3268,25 @@ class CameraWorker(QtCore.QThread):
                 pass
             self.mount_axis1_result.emit(False, "Axis-1 GoTo failed: {}".format(e), plate)
 
-    def _mount_connect(self, ip, two_axis=False):
+    def _mount_connect(self, ip, two_axis=False, preserve=False):
         # a fresh connect re-zeroes the board's step counter, so any axis-1 sync
-        # taken against the old origin is now meaningless
-        self._axis1_zero = None
+        # taken against the old origin is now meaningless — unless the mount kept
+        # running and we deliberately keep its count.
+        if not preserve:
+            self._axis1_zero = None
+        self.mount_status.emit("🔌 Connecting to the mount at {}…".format(ip))
         try:
             self._dither_mount = SkyWatcherMount(ip, logfn=lambda m: self.status.emit(m),
                                                  two_axis=two_axis)
-            info = self._dither_mount.connect()
+            info = self._dither_mount.connect(preserve_position=preserve)
+            if preserve:
+                saved = _load_axis1_sync()
+                if saved is not None:
+                    self._axis1_zero = saved
+                    self.mount_status.emit(
+                        "🔌 Mount connected ({}) — axis-1 sync restored from the last "
+                        "session; check one target before trusting a GoTo.".format(info))
+                    return
             self.mount_status.emit("🔌 Mount connected ({})".format(info))
         except Exception as e:              # noqa: BLE001
             self._dither_mount = None
@@ -3258,10 +3372,10 @@ class CameraWorker(QtCore.QThread):
                 elif kind == "set_stack":
                     self._stack_enabled = kw["on"]
                     if not kw["on"]:
-                        self._reset_stack()
+                        self._stack_reset_req = True
                 elif kind == "set_stack_full":
                     self._stack_full = bool(kw["on"])
-                    self._reset_stack()     # the accumulator changes size: start over
+                    self._stack_reset_req = True   # accumulator size changes: start over
                     self.status.emit(
                         "Live stack: {} resolution — restarting the stack.".format(
                             "FULL 24 MP" if self._stack_full else "half"))
@@ -3300,7 +3414,7 @@ class CameraWorker(QtCore.QThread):
                               "mount_track_probe"):
                     self._mount_cmd(kind, kw)
                 elif kind == "reset_stack":
-                    self._reset_stack()
+                    self._stack_reset_req = True          # the processor does it
                     self.status.emit("Stacking reset.")
                 elif kind == "set_kappa":
                     self._kappa_enabled = kw["on"]
@@ -3393,6 +3507,14 @@ class CameraWorker(QtCore.QThread):
                     self._seq_start = time.monotonic()
                     seq_type = os.path.basename(self._save_dir) or "lights"
                     self._seq_type = seq_type
+                    # flats / darks / bias go straight to disk: no preview, no stars,
+                    # no stacking — that work only makes sense on light frames.
+                    self._calibration = seq_type.lower() in ("flats", "darks", "bias",
+                                                             "dark", "flat", "offset")
+                    if self._calibration:
+                        self.status.emit(
+                            "📁 {}: frames are saved only — no preview, no stacking, so "
+                            "the series runs at the camera's own pace.".format(seq_type))
                     seq_mode = ("bulb {:.0f}s".format(self._bulb_seconds)
                                 if self._bulb else "camera speed")
                     self.seq_started.emit(self._seq_id, seq_type, seq_mode)
@@ -3655,6 +3777,10 @@ class CameraWorker(QtCore.QThread):
             pass
 
     def _end_sequence(self):
+        proc = getattr(self, "_proc", None)
+        if proc is not None and proc.isRunning() and not proc.idle():
+            self.status.emit("Finishing the last frames…")
+            proc.wait_idle(120.0)
         """Finalizes the ongoing sequence (burst) and emits its summary + result image."""
         if self._seq_start is None:
             return
@@ -3704,6 +3830,10 @@ class CameraWorker(QtCore.QThread):
                 self.mount_status.emit("⚠ Mount recovery failed: {}".format(e2))
 
     def _do_capture(self, backend):
+        """Take one frame and hand it over. Nothing heavy happens here: decoding,
+        measuring and stacking run on their own thread, so the next exposure starts
+        as soon as the file is down instead of waiting for the picture to be
+        processed — which used to add seconds to every cycle."""
         os.makedirs(self._save_dir, exist_ok=True)
         ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3]
         dest = os.path.join(self._save_dir, "shot_{}.arw".format(ts))
@@ -3717,10 +3847,47 @@ class CameraWorker(QtCore.QThread):
                 saved = backend.capture_to_file(dest)
             self._done += 1
             self._frame_times.append(time.monotonic() - t0 + self._interval)
+            exp_s = self._bulb_seconds if self._bulb else (backend.current_exposure_s() or 0.0)
+            self.capture_saved.emit(saved)
+            self.status.emit("Saved: {}".format(os.path.basename(saved)))
+            self._emit_cam_status(backend)
+            avg = (sum(self._frame_times) / len(self._frame_times)
+                   if self._frame_times else 0.0)
+            self.interval_progress.emit(self._done, self._total, avg)
+            self._post_frame(saved, self._done, exp_s)
+        except Exception as e:               # noqa: BLE001
+            if self._is_disconnect(e):
+                raise                         # let run() reconnect and retry the shot
+            self.status.emit("Capture failed: {}".format(e))
+
+    # -- processing, on its own thread -----------------------------------------
+    def _post_frame(self, saved, idx, exp_s):
+        """Queue a saved frame for processing (or skip it when nothing is needed)."""
+        if self._calibration:
+            # Flats, darks and bias are never displayed or stacked: they are only
+            # ever averaged later, by the master builder. Measuring stars on a dark
+            # frame is meaningless, and it cost seconds per frame.
+            self._log_row(idx, os.path.basename(saved),
+                          "bulb{:.0f}s".format(self._bulb_seconds) if self._bulb else "speed",
+                          self._bulb_seconds if self._bulb else "", -1, 0.0, "calibration")
+            self.capture_image_ready.emit(None, "{}  ·  #{}".format(
+                os.path.basename(saved), idx))
+            return
+        if self._proc is None or not self._proc.isRunning():
+            self._proc = _FrameProcessor(self)
+            self._proc.start()
+        light = self._proc.backlog() >= 3     # falling behind: keep the frame, skip the stack
+        self._proc.submit((saved, idx, exp_s, light))
+
+    def _process_frame(self, saved, idx, exp_s, light=False):
+        """Decode, measure, stack and display one saved frame. Runs on the processing
+        thread; only this thread touches the stack accumulators."""
+        try:
+            if self._stack_reset_req:
+                self._stack_reset_req = False
+                self._reset_stack()
             preview = _decode_preview_image(saved, full_demosaic=self._raw_full)
             self._last_preview = preview
-
-            # measurements on preview: stars + HFR + eccentricity (tracking, log)
             scount, hfr, ecc = -1, 0.0, 0.0
             pgray = None
             if preview is not None:
@@ -3738,7 +3905,6 @@ class CameraWorker(QtCore.QThread):
                     rejected = True
             if scount >= 0 and not rejected:
                 self._star_hist.append(scount)
-
             if rejected:                    # move rejected exposure to rejected/
                 try:
                     rej = os.path.join(self._save_dir, "rejected")
@@ -3747,21 +3913,17 @@ class CameraWorker(QtCore.QThread):
                     os.replace(saved, newp); saved = newp
                 except Exception:           # noqa: BLE001
                     pass
-
-            # tracking HFR/stars/eccentricity (except rejected shots)
             if not rejected and scount >= 0:
-                self.track_point.emit(self._done, hfr, scount, ecc)
-
-            # integration time of the sequence (kept shots only)
+                self.track_point.emit(idx, hfr, scount, ecc)
             if not rejected:
-                exp_s = self._bulb_seconds if self._bulb else (backend.current_exposure_s() or 0.0)
                 self._seq_count += 1
                 self._seq_integ += exp_s
                 self.seq_progress.emit(self._seq_id, self._seq_count, self._seq_integ)
 
             # visual live stacking — integrate LINEAR light from the RAW (like Siril);
             # fall back to the 8-bit preview if the RAW/rawpy isn't available.
-            if self._stack_enabled and preview is not None and pgray is not None and not rejected:
+            if (self._stack_enabled and not light and preview is not None
+                    and pgray is not None and not rejected):
                 stack_src = (_decode_linear(saved, half=not self._stack_full)
                              if self._stack_linear else None)
                 if stack_src is None:
@@ -3782,29 +3944,24 @@ class CameraWorker(QtCore.QThread):
                     if self._master_flat is not None:
                         stack_src = apply_flat(stack_src, self._master_flat)
                 self._accumulate_stack(stack_src)
+            elif light and self._stack_enabled and not rejected:
+                self.status.emit("⏩ Processing is behind — frame {} saved but not "
+                                 "stacked.".format(idx))
 
             mode = "bulb{:.0f}s".format(self._bulb_seconds) if self._bulb else "speed"
-            self._log_row(self._done, os.path.basename(saved), mode,
+            self._log_row(idx, os.path.basename(saved), mode,
                           self._bulb_seconds if self._bulb else "", scount,
                           round(hfr, 2), "rejected" if rejected else "ok")
-
-            self.capture_saved.emit(saved)
             star_txt = "  ·  ★{}".format(scount) if scount >= 0 else ""
             rej_txt = "  ·  ⚠ discarded" if rejected else ""
             cap = "{}  ·  {}{}{}".format(
                 os.path.basename(saved),
-                "{}/{}".format(self._done, self._total) if self._total else "#{}".format(self._done),
+                "{}/{}".format(idx, self._total) if self._total else "#{}".format(idx),
                 star_txt, rej_txt)
             self.capture_image_ready.emit(preview, cap)
-            avg = (sum(self._frame_times) / len(self._frame_times)
-                   if self._frame_times else 0.0)
-            self.interval_progress.emit(self._done, self._total, avg)
-            self._emit_cam_status(backend)
-            self.status.emit("Saved: {}".format(os.path.basename(saved)))
         except Exception as e:               # noqa: BLE001
-            if self._is_disconnect(e):
-                raise                         # let run() reconnect and retry the shot
-            self.status.emit("Capture failed: {}".format(e))
+            self.status.emit("Processing failed on {}: {}".format(
+                os.path.basename(saved), e))
 
     def _emit_config(self, backend):
         out = {}
@@ -7186,6 +7343,7 @@ class MainWindow(QtWidgets.QMainWindow):
                              ("T", self._toggle_stretch_shortcut),
                              ("P", self._toggle_fullscreen_preview),
                              ("V", self._toggle_public_view),
+                             ("X", self._mount_stop_now),
                              ("Escape", self._exit_fullscreen_preview)]:
             sc = QtGui.QShortcut(QtGui.QKeySequence(keyseq), self, activated=slot)
             sc.setContext(ctx)
@@ -7359,17 +7517,15 @@ class MainWindow(QtWidgets.QMainWindow):
         self.top_target_bar.left_widgets = [self.top_target_label, self.top_target_sub]
         tb.addSpacing(10)
         self.mount_btn = QtWidgets.QPushButton("🔭 Mount")
-        self.mount_btn.setToolTip("Connect to the mount, start/stop tracking, rotate the arm "
-                                  "manually, and set up dithering (Star Adventurer 2i, Wi-Fi).")
-        self.mount_btn.clicked.connect(self._open_mount_dialog)
+        self.mount_btn.setToolTip("Everything about the mount in one window: the two dial "
+                                  "readings for the target, the once-a-session setup, and "
+                                  "the control itself — connection, tracking, slews, "
+                                  "dithering. (Ctrl+G)")
+        self.mount_btn.setShortcut("Ctrl+G")
+        self.mount_btn.clicked.connect(lambda: self._open_manual_goto("point"))
         tb.addWidget(self.mount_btn)
         self.top_target_bar.right_widget = self.mount_btn
-        self.goto_btn = QtWidgets.QPushButton("🧭 GoTo")
-        self.goto_btn.setToolTip("Point at the session target: the two angles to set, and "
-                                 "the motorised slew of axis 1. (Ctrl+G)")
-        self.goto_btn.setShortcut("Ctrl+G")
-        self.goto_btn.clicked.connect(self._open_manual_goto)
-        tb.addWidget(self.goto_btn)
+        self.goto_btn = self.mount_btn          # older call sites still work
         self.planet_btn = QtWidgets.QPushButton("🪐 Planetary")
         self.planet_btn.setToolTip("Lucky imaging for the Moon & planets: keep the sharpest "
                                    "live-view frames and stack them.")
@@ -7383,6 +7539,8 @@ class MainWindow(QtWidgets.QMainWindow):
             "Being on the mount's Wi-Fi is not the same as NOUT having opened it: "
             "click here to connect.")
         self.track_pill.clicked.connect(self._track_pill_clicked)
+        self.track_pill.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.track_pill.customContextMenuRequested.connect(self._track_pill_menu)
         self.track_pill.setStyleSheet("color:#94a3b8; font-weight:bold; padding:0 8px;")
         tb.addWidget(self.track_pill)
         self.night_btn = QtWidgets.QPushButton(); self.night_btn.setCheckable(True)
@@ -9149,7 +9307,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sky_mgoto_btn.setToolTip("Angles to dial by hand on the two axes (polar "
                                       "circle + graduated L-bracket) to land on the "
                                       "target right now — no motorised GoTo needed.")
-        self.sky_mgoto_btn.clicked.connect(self._open_manual_goto)
+        self.sky_mgoto_btn.clicked.connect(lambda: self._open_manual_goto("point"))
         bar.addWidget(self.sky_mgoto_btn)
         bar.addStretch(1)
         # single, unified target readout (goal is shown on the map itself)
@@ -12109,7 +12267,7 @@ class MainWindow(QtWidgets.QMainWindow):
         from datetime import datetime as _dt
         return _dt.utcnow()
 
-    def _open_manual_goto(self):
+    def _open_manual_goto(self, tab="point"):
         """Dial readings that put the session goal in the centre of the frame.
 
         The two readings are the whole point, so they stay pinned at the top; the
@@ -12123,11 +12281,12 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         if getattr(self, "_mg_dlg", None) is not None:        # already open: raise it
             try:
+                self._mg_show_tab(tab)
                 self._mg_dlg.raise_(); self._mg_dlg.activateWindow(); return
             except RuntimeError:
                 self._mg_dlg = None
         dlg = QtWidgets.QDialog(self)
-        dlg.setWindowTitle("Manual GoTo — setting circles")
+        dlg.setWindowTitle("Mount — pointing, setup and control")
         dlg.setMinimumWidth(720)
         self._mg_dlg = dlg
         v = QtWidgets.QVBoxLayout(dlg)
@@ -12273,21 +12432,7 @@ class MainWindow(QtWidgets.QMainWindow):
 
         rg = QtWidgets.QGroupBox("Tracking rate")
         rgl = QtWidgets.QHBoxLayout(rg)
-        self._mg_rate = QtWidgets.QComboBox()
-        self._mg_rate.addItem("Auto (from target)", "auto")
-        self._mg_rate.addItem("Sidereal (stars, deep sky)", "sidereal")
-        self._mg_rate.addItem("Solar", "sun")
-        self._mg_rate.addItem("Lunar", "moon")
-        for _b in ("Mercury", "Venus", "Mars", "Jupiter", "Saturn", "Uranus", "Neptune"):
-            self._mg_rate.addItem(_b, _b.lower())
-        self._mg_rate.setToolTip("The Sun, Moon and planets drift against the stars, so "
-                                 "they need their own rate. NOUT takes it from the "
-                                 "ephemeris, which also gets the sign right: a planet in "
-                                 "retrograde needs tracking slightly FASTER than sidereal.")
-        self._mg_rate.setCurrentIndex(
-            max(0, self._mg_rate.findData(getattr(self, "_track_rate_choice", "auto"))))
-        self._mg_rate.currentIndexChanged.connect(
-            lambda *_: setattr(self, "_track_rate_choice", self._mg_rate.currentData()))
+        self._mg_rate = self._make_rate_combo()
         rgl.addWidget(self._mg_rate, 1)
         rb = QtWidgets.QPushButton("Apply rate"); rb.clicked.connect(self._mg_apply_rate)
         rgl.addWidget(rb)
@@ -12319,6 +12464,7 @@ class MainWindow(QtWidgets.QMainWindow):
         # =====================================================================
         page2, p2 = _page()
         tabs.addTab(page2, "⚙  Set up")
+        self._mg_tabs = tabs
         eng = self._mg_engine()
 
         pa = QtWidgets.QGroupBox("1 · Polar alignment — where Polaris sits right now")
@@ -12527,48 +12673,11 @@ class MainWindow(QtWidgets.QMainWindow):
         p2.addWidget(adv)
         p2.addStretch(1)
 
-        # =====================================================================
-        #  TAB 3 — No polar alignment
-        # =====================================================================
-        page3, p3 = _page()
-        tabs.addTab(page3, "✦  No polar alignment")
-        al = QtWidgets.QGroupBox("Two-star align — solve where the axis really points")
-        alv = QtWidgets.QVBoxLayout(al)
-        alv.addWidget(_hint(
-            "Use this only when you cannot polar-align. Centre a star, pick it on the Sky "
-            "Map, type the two dial readings in the Set up tab, then record it. Do that "
-            "for two stars — well apart, and one high one low — and solve.\n"
-            "Pointing is then corrected, but TRACKING is not: fine for finding and "
-            "framing, not for long exposures.".replace("\n", "<br><br>")))
-        for lb in alv.findChildren(QtWidgets.QLabel):
-            lb.setWordWrap(True)
-        brow = QtWidgets.QHBoxLayout()
-        self._mg_star_lbl = []
-        for i in (0, 1):
-            b = QtWidgets.QPushButton("◉  Record as star {}".format(i + 1))
-            b.setMinimumHeight(30)
-            b.clicked.connect(lambda _c=False, k=i: self._mg_record_star(k))
-            brow.addWidget(b)
-        alv.addLayout(brow)
-        for i in (0, 1):
-            lb = QtWidgets.QLabel("star {} — empty".format(i + 1))
-            lb.setStyleSheet("color:#94a3b8;"); lb.setWordWrap(True)
-            alv.addWidget(lb); self._mg_star_lbl.append(lb)
-        self._mg_pair_lbl = QtWidgets.QLabel(""); self._mg_pair_lbl.setWordWrap(True)
-        alv.addWidget(self._mg_pair_lbl)
-        arow = QtWidgets.QHBoxLayout()
-        sb = QtWidgets.QPushButton("⊙  Solve the axis"); sb.setMinimumHeight(30)
-        sb.clicked.connect(self._mg_solve_align)
-        cb = QtWidgets.QPushButton("↺  Back to polar-aligned")
-        cb.clicked.connect(self._mg_clear_align)
-        arow.addWidget(sb); arow.addWidget(cb)
-        alv.addLayout(arow)
-        self._mg_align_msg = QtWidgets.QLabel("")
-        self._mg_align_msg.setWordWrap(True); self._mg_align_msg.setStyleSheet("color:#cbd5e1;")
-        alv.addWidget(self._mg_align_msg)
-        p3.addWidget(al)
-        p3.addStretch(1)
-        self._mg_align_refresh()
+        # The two-star alignment tab is gone: this rig is polar-aligned with the
+        # polar scope, and a pointing model that does not fix tracking was never used.
+        # The solver itself stays in manual_goto.py for anyone who wants it back.
+
+        tabs.addTab(self._build_mount_page(), "🔭  Mount")
 
         # ---- footer ----------------------------------------------------------
         foot = QtWidgets.QHBoxLayout()
@@ -12592,6 +12701,12 @@ class MainWindow(QtWidgets.QMainWindow):
         dlg.finished.connect(lambda *_: (timer.stop(),
                                          setattr(self, "_mg_track_lbl", None),
                                          setattr(self, "_mg_dlg", None),
+                                         setattr(self, "_mg_tabs", None),
+                                         setattr(self, "_mount_dlg_lbl", None),
+                                         setattr(self, "_goal_slew_lbl", None),
+                                         setattr(self, "autocenter_btn", None),
+                                         setattr(self, "autocenter_stop_btn", None),
+                                         setattr(self, "_dither_plot", None),
                                          setattr(self, "_mg_dial_lbl", None),
                                          setattr(self, "_mg_live", None)))
         self._mg_refresh()
@@ -12602,8 +12717,16 @@ class MainWindow(QtWidgets.QMainWindow):
                 _lb.setWordWrap(True)
         # fit the screen: tabs keep it short, a scroll area catches the rest
         scr = self.screen().availableGeometry() if self.screen() else None
-        dlg.resize(760, min(760, scr.height() - 80) if scr else 720)
+        dlg.resize(780, min(800, scr.height() - 80) if scr else 740)
+        self._mg_show_tab(tab)
         dlg.show()
+
+    def _mg_show_tab(self, tab):
+        """'point', 'setup' or 'mount'."""
+        tabs = getattr(self, "_mg_tabs", None)
+        if tabs is None:
+            return
+        tabs.setCurrentIndex({"point": 0, "setup": 1, "mount": 2}.get(tab, 0))
 
     def _mg_record_star(self, idx):
         """Freeze the current target + instant + dial readings as one align star."""
@@ -12620,6 +12743,8 @@ class MainWindow(QtWidgets.QMainWindow):
         self._mg_align_refresh()
 
     def _mg_align_refresh(self):
+        if not getattr(self, "_mg_star_lbl", None):     # tab removed: nothing to show
+            return
         """Show what is recorded, and judge the pair before anything is solved."""
         import manual_goto
         stars = getattr(self, "_mg_align_stars", None) or [None, None]
@@ -12683,6 +12808,42 @@ class MainWindow(QtWidgets.QMainWindow):
     _RATE_BODIES = ("sun", "moon", "mercury", "venus", "mars", "jupiter",
                     "saturn", "uranus", "neptune")
 
+    def _make_rate_combo(self):
+        """A tracking-rate selector. Several of them exist (pointing tab, mount tab);
+        they share one setting, so picking a rate anywhere updates them all — and it
+        works with no target chosen, which is exactly when you need to say what to
+        follow."""
+        cb = QtWidgets.QComboBox()
+        cb.addItem("Auto (from target)", "auto")
+        cb.addItem("Sidereal (stars, deep sky)", "sidereal")
+        cb.addItem("Solar", "sun")
+        cb.addItem("Lunar", "moon")
+        for b in ("Mercury", "Venus", "Mars", "Jupiter", "Saturn", "Uranus", "Neptune"):
+            cb.addItem(b, b.lower())
+        cb.setToolTip("The Sun, Moon and planets drift against the stars, so they need "
+                      "their own rate. NOUT takes it from the ephemeris, which also gets "
+                      "the sign right: a planet in retrograde needs tracking slightly "
+                      "FASTER than sidereal.\n"
+                      "With no target chosen, 'Auto' means sidereal.")
+        cb.setCurrentIndex(max(0, cb.findData(getattr(self, "_track_rate_choice", "auto"))))
+        combos = getattr(self, "_rate_combos", None)
+        if combos is None:
+            combos = self._rate_combos = []
+        combos.append(cb)
+        cb.currentIndexChanged.connect(lambda *_: self._on_rate_choice(cb.currentData()))
+        return cb
+
+    def _on_rate_choice(self, choice):
+        self._track_rate_choice = choice
+        for cb in list(getattr(self, "_rate_combos", [])):
+            try:
+                if cb.currentData() != choice:
+                    cb.blockSignals(True)
+                    cb.setCurrentIndex(max(0, cb.findData(choice)))
+                    cb.blockSignals(False)
+            except RuntimeError:                       # its window was closed
+                self._rate_combos.remove(cb)
+
     def _mg_rate_body(self):
         """Which body's rate to use — explicit, or worked out from the target.
 
@@ -12695,6 +12856,27 @@ class MainWindow(QtWidgets.QMainWindow):
         goal = getattr(self, "_session_goal", None)
         name = (goal[0] if goal else "").strip().lower()
         return name if name in self._RATE_BODIES else "sidereal"
+
+    def _mount_stop_now(self):
+        """Everything stops: manual slew, GoTo, tracking. Reachable from anywhere,
+        because the moment you need it is never the moment to go looking for it."""
+        for cmd in ("mount_slew_stop", "mount_axis1_stop", "mount_track_stop"):
+            self.worker.post(cmd)
+        self.statusBar().showMessage("⛔ Mount stop requested — slew, GoTo and tracking.",
+                                     8000)
+
+    def _start_tracking(self, ip=None):
+        """Start the axis at the chosen rate: plain sidereal, or the rate of whatever
+        body is selected (or of the target, when the choice is 'Auto')."""
+        ip = ip or self._mip()
+        body = self._mg_rate_body()
+        if body == "sidereal":
+            self.worker.post("mount_track_start", ip=ip)
+        else:
+            self.worker.post("mount_set_track_rate", ip=ip, body=body,
+                             lat=self.t_lat.value(), lon=self.t_lon.value())
+        self.statusBar().showMessage(
+            "Tracking at the {} rate…".format(self._rate_mode_name(body)), 6000)
 
     def _mg_apply_rate(self, *args):
         import manual_goto
@@ -12760,6 +12942,17 @@ class MainWindow(QtWidgets.QMainWindow):
         if body == "moon":
             return "lunar"
         return "planet · {}".format(body.capitalize())
+
+    def _track_pill_menu(self, pos):
+        m = QtWidgets.QMenu(self)
+        stop = m.addAction("⛔  Stop the mount now")
+        m.addSeparator()
+        openw = m.addAction("Open the mount window")
+        act = m.exec(self.track_pill.mapToGlobal(pos))
+        if act is stop:
+            self._mount_stop_now()
+        elif act is openw:
+            self._open_manual_goto("mount")
 
     def _track_pill_clicked(self):
         """The indicator doubles as the connect button when there is nothing to show.
@@ -13191,9 +13384,13 @@ class MainWindow(QtWidgets.QMainWindow):
             return dt_utc.strftime("%H:%M:%S") + " UTC"
 
     def _open_mount_dialog(self):
-        dlg = QtWidgets.QDialog(self); dlg.setWindowTitle("Mount control")
-        dlg.setMinimumWidth(440)
-        v = QtWidgets.QVBoxLayout(dlg)
+        """Kept for the tracking pill and older call sites: same window, Mount tab."""
+        self._open_manual_goto(tab="mount")
+
+    def _build_mount_page(self):
+        """Connection, tracking, manual slews, auto-centring and the dither trail."""
+        page = QtWidgets.QWidget()
+        v = QtWidgets.QVBoxLayout(page)
         trow = QtWidgets.QHBoxLayout()
         trow.addWidget(QtWidgets.QLabel("Mount"))
         mtype = QtWidgets.QComboBox()
@@ -13218,14 +13415,39 @@ class MainWindow(QtWidgets.QMainWindow):
         def _two():
             return bool(mtype.currentData())
         row1 = QtWidgets.QHBoxLayout()
+        keep = QtWidgets.QCheckBox("kept running")
+        keep.setToolTip("Tick this when the mount has stayed powered since the last "
+                        "session: NOUT then keeps its step counter, and the axis-1 sync "
+                        "from last time is restored instead of being thrown away.")
+        self._mount_keep = keep
         cbtn = QtWidgets.QPushButton("🔌 Connect")
-        cbtn.clicked.connect(lambda: self.worker.post("mount_connect", ip=_ip(), two_axis=_two()))
+        cbtn.clicked.connect(lambda: self.worker.post("mount_connect", ip=_ip(),
+                                                      two_axis=_two(),
+                                                      preserve=keep.isChecked()))
         tbtn = QtWidgets.QPushButton("▶ Start tracking")
-        tbtn.clicked.connect(lambda: self.worker.post("mount_track_start", ip=_ip()))
+        tbtn.setToolTip("Starts the axis at the rate chosen below.")
+        tbtn.clicked.connect(lambda: self._start_tracking(_ip()))
         sbtn = QtWidgets.QPushButton("⏸ Stop tracking")
         sbtn.clicked.connect(lambda: self.worker.post("mount_track_stop"))
-        row1.addWidget(cbtn); row1.addWidget(tbtn); row1.addWidget(sbtn)
+        row1.addWidget(cbtn); row1.addWidget(keep); row1.addWidget(tbtn); row1.addWidget(sbtn)
         v.addLayout(row1)
+        stopall = QtWidgets.QPushButton("⛔  STOP THE MOUNT  (X)")
+        stopall.setToolTip("Stops every motion at once: slew, GoTo and tracking. "
+                           "The X key does the same from anywhere in the app.")
+        stopall.setStyleSheet("background:#7f1d1d; color:#fff; font-weight:600;")
+        stopall.setMinimumHeight(32)
+        stopall.clicked.connect(self._mount_stop_now)
+        v.addWidget(stopall)
+        rrow = QtWidgets.QHBoxLayout()
+        rlbl = QtWidgets.QLabel("Rate"); rlbl.setObjectName("cap")
+        rrow.addWidget(rlbl)
+        rrow.addWidget(self._make_rate_combo(), 1)
+        rapply = QtWidgets.QPushButton("Apply")
+        rapply.setToolTip("Applies the rate right away — and starts tracking if it is stopped.")
+        rapply.clicked.connect(self._mg_apply_rate)
+        rrow.addWidget(rapply)
+        v.addLayout(rrow)
+
         row2 = QtWidgets.QHBoxLayout()
         neg = QtWidgets.QPushButton("⏪ Rotate RA− (hold)")
         pos = QtWidgets.QPushButton("Rotate RA+ (hold) ⏩")
@@ -13243,11 +13465,6 @@ class MainWindow(QtWidgets.QMainWindow):
                            "recent plate-solve).")
         goalbtn.clicked.connect(lambda: self._slew_ra_to_goal(_ip()))
         row3.addWidget(goalbtn)
-        mgbtn = QtWidgets.QPushButton("🧭 Manual GoTo (dials)")
-        mgbtn.setToolTip("No motor on the second axis: read the two angles to set by "
-                         "hand on the polar circle and on the graduated L-bracket.")
-        mgbtn.clicked.connect(self._open_manual_goto)
-        row3.addWidget(mgbtn)
         v.addLayout(row3)
         row3b = QtWidgets.QHBoxLayout()
         self.autocenter_btn = QtWidgets.QPushButton("🤖 Auto-centre on goal")
@@ -13277,12 +13494,8 @@ class MainWindow(QtWidgets.QMainWindow):
         v.addWidget(dplot)
         self._dither_plot = dplot
         self._refresh_dither_plot()
-        dlg.finished.connect(lambda *_: (setattr(self, "_mount_dlg_lbl", None),
-                                         setattr(self, "_goal_slew_lbl", None),
-                                         setattr(self, "autocenter_btn", None),
-                                         setattr(self, "autocenter_stop_btn", None),
-                                         setattr(self, "_dither_plot", None)))
-        dlg.show()
+        v.addStretch(1)
+        return page
 
     def _on_dither_point(self, offset, shot):
         self._dither_hist.append((int(shot), float(offset)))
