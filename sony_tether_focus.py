@@ -2565,6 +2565,50 @@ class _MountQueue(QtCore.QThread):
                 pass
 
 
+def gallery_dir():
+    """Where the gallery keeps its copies: a folder you can browse and back up."""
+    base = QtCore.QStandardPaths.writableLocation(
+        QtCore.QStandardPaths.StandardLocation.PicturesLocation) or os.path.expanduser("~")
+    d = os.path.join(base, "NOUT Gallery")
+    os.makedirs(d, exist_ok=True)
+    return d
+
+
+def load_gallery():
+    """{object id: {"file", "date", "frames", "integ", "note"}}."""
+    try:
+        with open(os.path.join(gallery_dir(), "gallery.json"), encoding="utf-8") as f:
+            d = json.load(f)
+        return d if isinstance(d, dict) else {}
+    except Exception:                   # noqa: BLE001
+        return {}
+
+
+def save_gallery(d):
+    try:
+        with open(os.path.join(gallery_dir(), "gallery.json"), "w", encoding="utf-8") as f:
+            json.dump(d, f, indent=1)
+    except Exception as e:              # noqa: BLE001
+        print("[NOUT] gallery not saved:", e, file=sys.stderr, flush=True)
+
+
+def gallery_slots():
+    """Every slot of the collection: the 110 Messier first, then the named NGC/IC
+    objects NOUT knows a distance for — the ones people actually go after."""
+    out = [("M{}".format(i), "Messier") for i in range(1, 111)]
+    try:
+        import csv as _csv
+        with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "dso_info.csv"),
+                  newline="", encoding="utf-8") as f:
+            for row in _csv.DictReader(f):
+                oid = (row.get("id") or "").strip()
+                if oid and not re.match(r"(?i)^m\d+$", oid):
+                    out.append((oid, "NGC / IC"))
+    except Exception:                   # noqa: BLE001
+        pass
+    return out
+
+
 class _FrameProcessor(QtCore.QThread):
     """Decodes, measures and stacks saved frames, off the capture thread.
 
@@ -2614,7 +2658,8 @@ class CameraWorker(QtCore.QThread):
     frame_ready = Signal(object, float, object)  # (BGR frame, sharpness|nan, stars|None)
     capture_saved = Signal(str)
     capture_image_ready = Signal(object, str)  # (BGR preview ndarray | None, caption)
-    interval_running = Signal(bool)          # True when intervalometer is running
+    interval_running = Signal(bool)
+    interval_paused = Signal(bool)         # the series is held, not finished          # True when intervalometer is running
     interval_progress = Signal(int, int, float)  # (done, total|0=unlimited, avg sec/shot)
     cam_status = Signal(str)                  # battery + free disk
     seq_started = Signal(int, str, str)       # (id, type, mode)
@@ -2647,6 +2692,7 @@ class CameraWorker(QtCore.QThread):
         self._total = 0
         self._done = 0
         self._next_shot = None
+        self._paused_at = None         # (next shot time, frames left) while held
         self._speed_recovery = 1.2   # USB/camera recovery pause after each speed-mode shot
         self._frame_times = deque(maxlen=8)   # recent durations per shot (for ETA)
         self._save_dir = os.path.expanduser("~/SonyTether")
@@ -2866,8 +2912,8 @@ class CameraWorker(QtCore.QThread):
                             break
                         self._live_fail = 0
                     else:
-                        self.status.emit("Preview: {}".format(e))
-                        self.msleep(50)
+                        self._say("Live view: {}".format(e), key="preview", min_s=5.0)
+                        self.msleep(200)
             else:
                 self.msleep(60)               # intervalometer running or live view off
 
@@ -2895,6 +2941,20 @@ class CameraWorker(QtCore.QThread):
         needles = ("could not claim", "find the requested device", "no camera",
                    "not connected", "i/o", "input/output", "could not find")
         return any(n in s for n in needles)
+
+    def _say(self, msg, key=None, min_s=4.0):
+        """Status message that does not repeat itself. The preview loop used to emit
+        the same failure twenty times a second, which made the status bar flicker."""
+        key = key or msg.split(":")[0]
+        last = getattr(self, "_say_last", None)
+        if last is None:
+            last = self._say_last = {}
+        now = time.monotonic()
+        prev_t, prev_msg = last.get(key, (0.0, None))
+        if msg == prev_msg and now - prev_t < min_s:
+            return
+        last[key] = (now, msg)
+        self.status.emit(msg)
 
     def _pump_stop(self):
         """While blocked reconnecting, honour a Stop/Quit; keep other commands."""
@@ -3325,6 +3385,7 @@ class CameraWorker(QtCore.QThread):
         self.cam_status.emit("⚠ reconnecting…")
         is_sim = getattr(self._make_backend, "__name__", "") == "SimBackend"
         delay_ms = 600
+        waited = said = 0.0
         while self._running:
             self._pump_stop()
             self._drain_mount_only()          # mount connect/track/dither work w/o camera
@@ -3345,6 +3406,11 @@ class CameraWorker(QtCore.QThread):
                     return None
                 self.msleep(100)
             delay_ms = min(int(delay_ms * 1.4), 4000)
+            waited += delay_ms / 1000.0
+            if waited - said > 20.0:           # a word every 20 s, not on every try
+                said = waited
+                self._say("⏳ Still waiting for the camera ({:.0f} s) — USB set to PC "
+                          "Remote, body awake?".format(waited), key="wait", min_s=0.0)
         return None
 
     # -- internals ----------------------------------------------------------
@@ -3499,6 +3565,8 @@ class CameraWorker(QtCore.QThread):
                         except Exception as e:         # noqa: BLE001
                             self.status.emit("Could not check the shutter speed: {}".format(e))
                     self._next_shot = time.monotonic()  # first shot immediate
+                    self._paused_at = None
+                    self.interval_paused.emit(False)
                     self.interval_running.emit(True)    # -> switch to review mode
                     # new sequence (burst)
                     self._seq_id += 1
@@ -3523,8 +3591,29 @@ class CameraWorker(QtCore.QThread):
                     self.interval_progress.emit(0, self._total, est)
                     self.status.emit("Intervalometer started{}.".format(
                         "" if self._total else " (unlimited)"))
+                elif kind == "pause_interval":
+                    # Hold the series where it is: same sequence number, same count,
+                    # same stack. Starting a new series instead would open a second
+                    # burst and throw the integration away.
+                    if self._next_shot is not None:
+                        self._paused_at = (self._next_shot, self._remaining)
+                        self._next_shot = None
+                        self.interval_paused.emit(True)
+                        self.status.emit(
+                            "⏸ Series paused after the current frame — {} left of {}. "
+                            "Resume when you are ready.".format(self._remaining, self._total)
+                            if self._total else "⏸ Series paused.")
+                elif kind == "resume_interval":
+                    if getattr(self, "_paused_at", None) is not None:
+                        self._next_shot = time.monotonic()
+                        self._paused_at = None
+                        self.interval_paused.emit(False)
+                        self.status.emit("▶ Series resumed — same sequence, same stack.")
                 elif kind == "stop_interval":
-                    was_running = self._next_shot is not None
+                    was_running = (self._next_shot is not None
+                                   or getattr(self, "_paused_at", None) is not None)
+                    self._paused_at = None
+                    self.interval_paused.emit(False)
                     self._next_shot = None
                     self._abort_exposure = True        # interrupts ongoing bulb exposure
                     if was_running:
@@ -5276,7 +5365,7 @@ class AstroWorker(QtCore.QThread):
                      r.transit_local.strftime("%Hh%M"), r.moon_sep, fitmap[r.fits],
                      float(r.target.coord.ra.deg), float(r.target.coord.dec.deg),
                      r.target.type, getattr(r, "moon_av", None),
-                     getattr(r, "clear_h", None))
+                     getattr(r, "clear_h", None), float(r.target.size_arcmin or 0.0))
                     for r in recos]
             self.done.emit((hdr, rows), "")
         except Exception as e:        # noqa: BLE001
@@ -6269,7 +6358,10 @@ def _make_icon(name, color="#e8eaf2", size=20):
     pen = QtGui.QPen(QtGui.QColor(color), 1.7); pen.setJoinStyle(Qt.RoundJoin)
     pen.setCapStyle(Qt.RoundCap); q.setPen(pen); q.setBrush(Qt.NoBrush)
     s = size
-    if name == "public":                   # a screen, and an audience
+    if name == "gallery":                  # a sheet of little pictures
+        for x, y in ((3, 3), (11, 3), (3, 11), (11, 11)):
+            q.drawRoundedRect(QtCore.QRectF(x, y, 6, 6), 1.2, 1.2)
+    elif name == "public":                 # a screen, and an audience
         q.drawRoundedRect(QtCore.QRectF(2.5, 2.5, s - 5, s * 0.52), 1.5, 1.5)
         for cx in (s * 0.36, s * 0.64):
             q.drawEllipse(QtCore.QPointF(cx, s * 0.72), 1.6, 1.6)
@@ -7297,6 +7389,7 @@ class MainWindow(QtWidgets.QMainWindow):
         worker.capture_saved.connect(self.on_saved)
         worker.capture_image_ready.connect(self.on_capture_image)
         worker.interval_running.connect(self.on_interval_state)
+        worker.interval_paused.connect(self.on_interval_paused)
         worker.interval_progress.connect(self.on_interval_progress)
         worker.interval_progress.connect(self._plan_burst_progress)
         worker.cam_status.connect(self.on_cam_status)
@@ -7581,14 +7674,16 @@ class MainWindow(QtWidgets.QMainWindow):
         _targets = self._build_targets_tab()
         _skymap = self._build_skymap_tab()
         _mosaic = self._build_mosaic_tab()
+        _gallery = self._build_gallery_tab()
         self.tabs.addTab(_shoot, "Shooting")
         self.tabs.addTab(_mosaic, "Mosaic View")
         self.tabs.addTab(_results, "Results")
         self.tabs.addTab(_targets, "Targets")
         self.tabs.addTab(_skymap, "Sky Map")
+        self.tabs.addTab(_gallery, "Gallery")
         self._shoot_index, self._mosaic_index, self._results_index, \
-            self._targets_index, self._skymap_index = 0, 1, 2, 3, 4
-        self._tab_icon_names = ["camera", "grid", "image", "target", "map"]
+            self._targets_index, self._skymap_index, self._gallery_index = 0, 1, 2, 3, 4, 5
+        self._tab_icon_names = ["camera", "grid", "image", "target", "map", "gallery"]
         night0 = getattr(self, "_night", False)
         if hasattr(self, "night_btn"):
             self.night_btn.blockSignals(True)
@@ -8280,8 +8375,14 @@ class MainWindow(QtWidgets.QMainWindow):
         sc.row("Pause", self.iv_interval, "Shots", self.iv_count, self.chk_unlimited)
         self.shot_btn.setText("Single shot")
         self.iv_start.setText("▶ Series"); self.iv_stop.setText("⏹ Stop")
-        sc.row(self.shot_btn, self.iv_start, self.iv_stop)
-        for b in (self.shot_btn, self.iv_start, self.iv_stop):
+        self.iv_pause = QtWidgets.QPushButton("⏸ Pause")
+        self.iv_pause.setToolTip("Finishes the exposure under way, then holds the series. "
+                                 "Resuming carries on with the same sequence, the same "
+                                 "count and the same stack — nothing is started over.")
+        self.iv_pause.setEnabled(False)
+        self.iv_pause.clicked.connect(self._toggle_pause)
+        sc.row(self.shot_btn, self.iv_start, self.iv_pause, self.iv_stop)
+        for b in (self.shot_btn, self.iv_start, self.iv_pause, self.iv_stop):
             b.setSizePolicy(QtWidgets.QSizePolicy.Expanding, QtWidgets.QSizePolicy.Fixed)
         self.chk_integ_target.setText("Stop at")
         self.integ_label.setObjectName("cap"); self.integ_label.setWordWrap(False)
@@ -8417,6 +8518,230 @@ class MainWindow(QtWidgets.QMainWindow):
         for w in [tab] + tab.findChildren(QtWidgets.QWidget):
             w.setAttribute(Qt.WA_LayoutUsesWidgetRect, True)
         return tab
+
+    def _build_gallery_tab(self):
+        """A collection sheet: every Messier and the main NGC/IC objects, the ones you
+        have photographed showing your own picture, the rest waiting."""
+        tab = QtWidgets.QWidget()
+        lay = QtWidgets.QVBoxLayout(tab); lay.setSpacing(8)
+        bar = QtWidgets.QHBoxLayout()
+        self.gal_count = QtWidgets.QLabel(""); self.gal_count.setStyleSheet(
+            "font-size:15px; font-weight:600;")
+        bar.addWidget(self.gal_count)
+        bar.addSpacing(16)
+        f = QtWidgets.QLabel("Show"); f.setObjectName("cap"); bar.addWidget(f)
+        self.gal_filter = QtWidgets.QComboBox()
+        for lab, key in (("Everything", "all"), ("Captured", "done"), ("Still missing", "todo"),
+                         ("Messier", "messier"), ("NGC / IC", "ngc")):
+            self.gal_filter.addItem(lab, key)
+        self.gal_filter.activated.connect(lambda *_: self._refresh_gallery())
+        bar.addWidget(self.gal_filter)
+        self.gal_search = QtWidgets.QLineEdit()
+        self.gal_search.setPlaceholderText("Find an object…")
+        self.gal_search.textChanged.connect(lambda *_: self._refresh_gallery())
+        bar.addWidget(self.gal_search, 1)
+        addb = QtWidgets.QPushButton("＋ Add a photo…")
+        addb.setObjectName("primary")
+        addb.clicked.connect(lambda: self._gallery_add())
+        bar.addWidget(addb)
+        openb = QtWidgets.QPushButton("📂 Folder")
+        openb.setToolTip("Opens the folder where the gallery keeps its copies.")
+        openb.clicked.connect(lambda: self._open_folder(gallery_dir()))
+        bar.addWidget(openb)
+        lay.addLayout(bar)
+
+        self.gal_list = QtWidgets.QListWidget()
+        self.gal_list.setViewMode(QtWidgets.QListView.ViewMode.IconMode)
+        self.gal_list.setIconSize(QtCore.QSize(180, 180))
+        self.gal_list.setGridSize(QtCore.QSize(200, 214))
+        self.gal_list.setResizeMode(QtWidgets.QListView.ResizeMode.Adjust)
+        self.gal_list.setMovement(QtWidgets.QListView.Movement.Static)
+        self.gal_list.setSpacing(6)
+        self.gal_list.setWordWrap(True)
+        self.gal_list.itemDoubleClicked.connect(self._gallery_open)
+        self.gal_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.gal_list.customContextMenuRequested.connect(self._gallery_menu)
+        lay.addWidget(self.gal_list, 1)
+        QtCore.QTimer.singleShot(0, self._refresh_gallery)
+        return tab
+
+    def _gallery_thumb(self, path, done):
+        """Thumbnail for a slot: the photo, or a dim placeholder for a missing one."""
+        pm = QtGui.QPixmap(180, 180)
+        if done and path and os.path.exists(path):
+            img = QtGui.QPixmap(path)
+            if not img.isNull():
+                return QtGui.QIcon(img.scaled(180, 180, Qt.KeepAspectRatio,
+                                              Qt.SmoothTransformation))
+        pm.fill(QtGui.QColor("#0c0f16"))
+        q = QtGui.QPainter(pm); q.setRenderHint(QtGui.QPainter.Antialiasing)
+        q.setPen(QtGui.QPen(QtGui.QColor(255, 255, 255, 28), 1))
+        q.drawRoundedRect(QtCore.QRectF(4, 4, 172, 172), 10, 10)
+        q.setPen(QtGui.QColor(255, 255, 255, 40))
+        f = QtGui.QFont(); f.setPixelSize(44); q.setFont(f)
+        q.drawText(QtCore.QRectF(0, 0, 180, 180), Qt.AlignCenter, "?")
+        q.end()
+        return QtGui.QIcon(pm)
+
+    def _refresh_gallery(self):
+        if not hasattr(self, "gal_list"):
+            return
+        gal = load_gallery()
+        self.gal_list.clear()
+        want = self.gal_filter.currentData()
+        needle = self.gal_search.text().strip().lower()
+        names = {}
+        try:
+            for o in getattr(self.skymap, "dso", []) or []:
+                names[str(o.get("id", "")).upper()] = o.get("name") or ""
+        except Exception:               # noqa: BLE001
+            pass
+        slots = gallery_slots()
+        known = {k for k, _ in slots}
+        slots += [(k, "Other") for k in gal if k not in known]        # anything you added
+        nm_done = ngc_done = 0
+        for oid, kind in slots:
+            entry = gal.get(oid)
+            done = bool(entry)
+            if done:
+                if kind == "Messier":
+                    nm_done += 1
+                elif kind == "NGC / IC":
+                    ngc_done += 1
+            if want == "done" and not done:
+                continue
+            if want == "todo" and done:
+                continue
+            if want == "messier" and kind != "Messier":
+                continue
+            if want == "ngc" and kind != "NGC / IC":
+                continue
+            label = names.get(oid.upper(), "")
+            if needle and needle not in oid.lower() and needle not in label.lower():
+                continue
+            text = oid if not label else "{}\n{}".format(oid, label)
+            it = QtWidgets.QListWidgetItem(self._gallery_thumb(
+                (entry or {}).get("file"), done), text)
+            it.setData(Qt.UserRole, oid)
+            it.setTextAlignment(Qt.AlignHCenter | Qt.AlignTop)
+            if not done:
+                it.setForeground(QtGui.QBrush(QtGui.QColor("#6b7280")))
+            else:
+                tip = [oid]
+                if entry.get("date"):
+                    tip.append(entry["date"])
+                if entry.get("frames"):
+                    tip.append("{} frames".format(entry["frames"]))
+                if entry.get("integ"):
+                    tip.append(_fmt_dur(float(entry["integ"])))
+                it.setToolTip("  ·  ".join(tip))
+            self.gal_list.addItem(it)
+        self.gal_count.setText("Messier {}/110   ·   NGC / IC {}   ·   {} in the collection"
+                               .format(nm_done, ngc_done, len(gal)))
+
+    def _gallery_add(self, oid=None, src=None, frames=None, integ=None):
+        """Put a picture in the collection: pick the object, then the file."""
+        if oid is None:
+            goal = getattr(self, "_session_goal", None)
+            default = goal[0] if goal else ""
+            oid, ok = QtWidgets.QInputDialog.getText(
+                self, "Add to the gallery",
+                "Which object? (M31, NGC7000, IC1805…)", text=default)
+            if not ok or not oid.strip():
+                return
+            oid = oid.strip().upper().replace(" ", "")
+        if src is None:
+            src, _ = QtWidgets.QFileDialog.getOpenFileName(
+                self, "Picture of {}".format(oid), self._effective_dir() or os.path.expanduser("~"),
+                "Images (*.png *.jpg *.jpeg *.tif *.tiff)")
+            if not src:
+                return
+        img = QtGui.QImage(src)
+        if img.isNull():
+            self.statusBar().showMessage("That file is not an image NOUT can read.", 6000)
+            return
+        dest = os.path.join(gallery_dir(), "{}.jpg".format(oid))
+        if img.width() > 2400:
+            img = img.scaledToWidth(2400, Qt.SmoothTransformation)
+        img.save(dest, "JPG", 92)
+        gal = load_gallery()
+        gal[oid] = {"file": dest, "date": datetime.now().strftime("%Y-%m-%d"),
+                    "frames": frames, "integ": integ,
+                    "note": (gal.get(oid) or {}).get("note", "")}
+        save_gallery(gal)
+        self._refresh_gallery()
+        self.statusBar().showMessage("{} added to the gallery.".format(oid), 6000)
+
+    def _gallery_open(self, item):
+        oid = item.data(Qt.UserRole)
+        entry = load_gallery().get(oid)
+        if not entry:
+            self._gallery_add(oid=oid)
+            return
+        dlg = QtWidgets.QDialog(self); dlg.setWindowTitle(oid)
+        v = QtWidgets.QVBoxLayout(dlg)
+        pic = QtWidgets.QLabel(); pic.setAlignment(Qt.AlignCenter)
+        pm = QtGui.QPixmap(entry.get("file", ""))
+        scr = self.screen().availableGeometry() if self.screen() else None
+        side = min(1100, (scr.width() - 120) if scr else 1100)
+        if not pm.isNull():
+            pic.setPixmap(pm.scaled(side, side, Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        v.addWidget(pic, 1)
+        dist = fmt_distance(ly=dso_distance_ly(oid))
+        bits = [b for b in (entry.get("date"),
+                            "{} frames".format(entry["frames"]) if entry.get("frames") else "",
+                            _fmt_dur(float(entry["integ"])) if entry.get("integ") else "",
+                            dist) if b]
+        info = QtWidgets.QLabel("   ·   ".join(bits)); info.setObjectName("cap")
+        v.addWidget(info)
+        row = QtWidgets.QHBoxLayout()
+        rep_ = QtWidgets.QPushButton("Replace photo…")
+        rep_.clicked.connect(lambda: (dlg.accept(), self._gallery_add(oid=oid)))
+        rm = QtWidgets.QPushButton("Remove from gallery")
+        rm.clicked.connect(lambda: (self._gallery_remove(oid), dlg.accept()))
+        ok = QtWidgets.QPushButton("Close"); ok.setObjectName("primary")
+        ok.clicked.connect(dlg.accept)
+        row.addWidget(rep_); row.addWidget(rm); row.addStretch(1); row.addWidget(ok)
+        v.addLayout(row)
+        dlg.show()
+
+    def _gallery_remove(self, oid):
+        gal = load_gallery()
+        if oid in gal:
+            gal.pop(oid)
+            save_gallery(gal)
+            self._refresh_gallery()
+            self.statusBar().showMessage(
+                "{} removed from the gallery (the file stays in the folder).".format(oid), 6000)
+
+    def _gallery_menu(self, pos):
+        item = self.gal_list.itemAt(pos)
+        if item is None:
+            return
+        oid = item.data(Qt.UserRole)
+        m = QtWidgets.QMenu(self)
+        a_add = m.addAction("Add or replace the photo…")
+        a_tgt = m.addAction("Make it the session target")
+        a_rm = m.addAction("Remove from the gallery")
+        act = m.exec(self.gal_list.viewport().mapToGlobal(pos))
+        if act is a_add:
+            self._gallery_add(oid=oid)
+        elif act is a_rm:
+            self._gallery_remove(oid)
+        elif act is a_tgt:
+            self.t_search.setText(oid); self._search_target()
+
+    def _open_folder(self, d):
+        try:
+            os.makedirs(d, exist_ok=True)
+            if sys.platform == "darwin":
+                subprocess.Popen(["open", d])
+            elif sys.platform.startswith("linux"):
+                subprocess.Popen(["xdg-open", d])
+            else:
+                os.startfile(d)         # noqa: B606  (Windows)
+        except Exception as e:          # noqa: BLE001
+            self.statusBar().showMessage("Could not open: {}".format(e), 5000)
 
     def _build_results_tab(self):
         tab = QtWidgets.QWidget()
@@ -9116,6 +9441,35 @@ class MainWindow(QtWidgets.QMainWindow):
         self.hz_edit.clicked.connect(self._edit_horizon)
         hrow.addWidget(self.hz_edit)
         lay.addLayout(hrow)
+
+        vrow = QtWidgets.QHBoxLayout(); vrow.setSpacing(8)
+        sl = QtWidgets.QLabel("Sort"); sl.setObjectName("cap"); vrow.addWidget(sl)
+        self.t_sort = QtWidgets.QComboBox()
+        self.t_sort.addItem("Largest for my focal", "size")
+        self.t_sort.addItem("Best tonight", "score")
+        self.t_sort.addItem("Highest", "alt")
+        self.t_sort.addItem("Longest visible", "clear")
+        self.t_sort.setToolTip("Largest: the objects that fill the most of your frame at "
+                               "the focal length set above — the ones worth this rig.")
+        self.t_sort.activated.connect(lambda *_: self._apply_target_view())
+        vrow.addWidget(self.t_sort)
+        cl_ = QtWidgets.QLabel("Collection"); cl_.setObjectName("cap"); vrow.addWidget(cl_)
+        self.t_season = QtWidgets.QComboBox()
+        self.t_season.addItem("Tonight (all)", "all")
+        self.t_season.addItem("Autumn sky", "autumn")
+        self.t_season.addItem("Winter sky", "winter")
+        self.t_season.addItem("Spring sky", "spring")
+        self.t_season.addItem("Summer sky", "summer")
+        self.t_season.addItem("Messier only", "messier")
+        self.t_season.addItem("Fits my frame", "fits")
+        self.t_season.setToolTip("Seasons group objects by right ascension — the part of "
+                                 "the sky that culminates in the evening at that time of "
+                                 "year. They are shown only if they are up tonight.")
+        self.t_season.activated.connect(lambda *_: self._apply_target_view())
+        vrow.addWidget(self.t_season)
+        self.t_count_lbl = QtWidgets.QLabel(""); self.t_count_lbl.setObjectName("cap")
+        vrow.addWidget(self.t_count_lbl); vrow.addStretch(1)
+        lay.addLayout(vrow)
         QtCore.QTimer.singleShot(0, self._refresh_horizon_combo)
         QtCore.QTimer.singleShot(0, self._update_tfov)
 
@@ -9135,10 +9489,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.t_search_msg.setStyleSheet("color:#94a3b8;")
         lay.addWidget(self.t_search_msg)
 
-        self.t_table = QtWidgets.QTableWidget(0, 7)
+        self.t_table = QtWidgets.QTableWidget(0, 9)
         self.t_table.setHorizontalHeaderLabels(
-            ["Object", "Name", "Max Alt", "Clear", "Transit", "ΔMoon · avoid", "Framing"])
-        self.t_table.horizontalHeaderItem(3).setToolTip(
+            ["Object", "Name", "Size", "Max Alt", "Clear", "Transit", "ΔMoon · avoid",
+             "Framing", "rank"])
+        self.t_table.horizontalHeaderItem(2).setToolTip(
+            "Apparent size, and how much of the frame width it fills at your focal length.")
+        self.t_table.horizontalHeaderItem(4).setToolTip(
             "Hours tonight above h min — and above your local horizon when one is active.")
         self.t_table.horizontalHeader().setStretchLastSection(True)
         self.t_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
@@ -9147,6 +9504,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.t_table.setContextMenuPolicy(Qt.CustomContextMenu)
         self.t_table.customContextMenuRequested.connect(self._target_context_menu)
         self.t_table.setSortingEnabled(True)
+        self.t_table.setColumnHidden(8, True)      # holds the computed order
         self.t_table.setMinimumHeight(420)
         self.t_table.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding,
                                    QtWidgets.QSizePolicy.Policy.Expanding)
@@ -10353,10 +10711,32 @@ class MainWindow(QtWidgets.QMainWindow):
         # on_interval_state(True/False), exactement comme pour une séquence.
 
     def _toggle_interval(self):
-        if self.review_mode and not self._await_done:
-            self.worker.post("stop_interval")
+        """The S key: pause or resume a running series, or start one. Stopping for
+        good stays a deliberate click on Stop."""
+        if getattr(self, "_iv_paused", False) or (self.review_mode and not self._await_done):
+            self._toggle_pause()
         else:
             self._start_interval()
+
+    def _toggle_pause(self):
+        if getattr(self, "_iv_paused", False):
+            self.worker.post("resume_interval")
+        elif getattr(self, "_iv_running", False):
+            self.worker.post("pause_interval")
+
+    @Slot(bool)
+    def on_interval_paused(self, paused):
+        self._iv_paused = bool(paused)
+        self.iv_pause.setText("▶ Resume" if paused else "⏸ Pause")
+        self.iv_pause.setEnabled(bool(paused) or bool(getattr(self, "_iv_running", False)))
+        self.iv_start.setEnabled(not paused and not getattr(self, "_iv_running", False))
+        self.rec_label.setText("⏸ PAUSED — the series is held, press Resume"
+                               if paused else "● REC — sequence in progress")
+        self.rec_label.setStyleSheet(
+            "color:#fff;background:{};font-weight:bold;padding:3px;".format(
+                "#92400e" if paused else "#b91c1c"))
+        if paused:
+            self.prog_label.setText("Paused — Resume to carry on")
 
     @Slot(str)
     def on_cam_status(self, s):
@@ -10490,8 +10870,59 @@ class MainWindow(QtWidgets.QMainWindow):
         if not self.t_search.text().strip():   # don't clobber an active search
             self._populate_target_table(hdr, rows)
 
+    #: right-ascension windows of the four seasonal skies (hours), evening culmination
+    _SEASON_RA = {"winter": (4, 9), "spring": (9, 15), "summer": (15, 21), "autumn": (21, 4)}
+
+    def _apply_target_view(self):
+        """Re-show the last plan with the current sort order and collection."""
+        plan = getattr(self, "_last_plan", None)
+        if plan:
+            self._populate_target_table(plan[0], plan[1])
+
+    @staticmethod
+    def _frame_fit(size_arcmin, fov_w_deg):
+        """How well an object suits the frame: 1.0 fills it, less is smaller, and
+        anything wider than the frame is knocked back."""
+        frac = (float(size_arcmin) / 60.0) / max(float(fov_w_deg), 1e-6)
+        return min(frac, 1.0) - 0.35 * max(frac - 1.0, 0.0)
+
+    def _filter_sort_targets(self, rows):
+        mode = self.t_sort.currentData() if hasattr(self, "t_sort") else "size"
+        coll = self.t_season.currentData() if hasattr(self, "t_season") else "all"
+        fw, _fh = fov_deg(self.t_focal.value())
+        out = []
+        for r in rows:
+            oid = r[0]
+            ra = float(r[6]) if len(r) >= 8 and r[6] is not None else None
+            size_am = float(r[11]) if len(r) >= 12 and r[11] else 0.0
+            if coll in self._SEASON_RA and ra is not None:
+                lo, hi = self._SEASON_RA[coll]
+                h = (ra / 15.0) % 24.0
+                inside = (lo <= h < hi) if lo < hi else (h >= lo or h < hi)
+                if not inside:
+                    continue
+            elif coll == "messier" and not re.match(r"(?i)^m\s*\d+$", oid):
+                continue
+            elif coll == "fits" and not (0 < size_am / 60.0 <= fw * 0.9):
+                continue
+            out.append(r)
+        if mode == "size":
+            # Largest first, but an object wider than the frame is not a better target
+            # than one that fills it: rank by how much of the frame it covers, capped.
+            out.sort(key=lambda r: self._frame_fit(
+                float(r[11]) if len(r) >= 12 and r[11] else 0.0, fw), reverse=True)
+        elif mode == "alt":
+            out.sort(key=lambda r: float(r[2]), reverse=True)
+        elif mode == "clear":
+            out.sort(key=lambda r: float(r[10] or 0), reverse=True)
+        return out
+
     def _populate_target_table(self, hdr, rows):
         self.t_header.setText(hdr)
+        total = len(rows)
+        rows = self._filter_sort_targets(rows)
+        if hasattr(self, "t_count_lbl"):
+            self.t_count_lbl.setText("{} of {} targets".format(len(rows), total))
         self.t_table.setSortingEnabled(False)  # avoid reordering mid-fill
         self.t_table.setRowCount(len(rows))
         for i, row in enumerate(rows):
@@ -10500,6 +10931,7 @@ class MainWindow(QtWidgets.QMainWindow):
             otype = row[8] if len(row) >= 9 else ""
             moon_av = row[9] if len(row) >= 10 else None
             clear_h = row[10] if len(row) >= 11 else None
+            size_am = float(row[11]) if len(row) >= 12 and row[11] else 0.0
             if name and name != oid:
                 disp_name = _translate_target(name)   # FR planner names -> EN; EN names unchanged
             elif otype and otype not in ("?", ""):
@@ -10520,7 +10952,19 @@ class MainWindow(QtWidgets.QMainWindow):
                 mins = int(round(clear_h * 60))
                 clear_txt = "{}h{:02d}".format(mins // 60, mins % 60) if mins else "0"
                 clear_key = clear_h
-            cells = [(oid, id_key), (disp_name, disp_name.lower()),
+            if size_am <= 0:
+                size_txt, size_key = "—", -1.0
+            else:
+                fw, _fh = fov_deg(self.t_focal.value())
+                frac = (size_am / 60.0) / max(fw, 1e-6)
+                size_txt = ("{:.1f}°".format(size_am / 60.0) if size_am >= 60
+                            else "{:.0f}′".format(size_am))
+                size_txt += "  ({:.0f}%)".format(frac * 100) if frac >= 0.01 else "  (<1%)"
+                # Sorting on how much of the frame it fills, not on raw arcminutes:
+                # an object twice as wide as the frame is not a better target than one
+                # that fills it, so anything past 100 % is pushed back down.
+                size_key = self._frame_fit(size_am, fw)
+            cells = [(oid, id_key), (disp_name, disp_name.lower()), (size_txt, size_key),
                      ("{:.0f}°".format(hmax), hmax), (clear_txt, clear_key), (transit, transit),
                      (sep_txt, 999 if sep != sep else sep), (str(fit), str(fit))]
             for j, (txt, key) in enumerate(cells):
@@ -10528,7 +10972,17 @@ class MainWindow(QtWidgets.QMainWindow):
                 if j == 0 and ra_deg is not None:
                     it.setData(Qt.UserRole, (oid, ra_deg, dec_deg))
                 self.t_table.setItem(i, j, it)
+            self.t_table.setItem(i, 8, _SortItem("", float(i)))   # the order we computed
         self.t_table.setSortingEnabled(True)
+        # Enabling sorting re-sorts by whatever column carries the indicator — by
+        # default the first one, which threw away the ranking every time. Sort
+        # explicitly on the column the chosen mode is about.
+        mode = self.t_sort.currentData() if hasattr(self, "t_sort") else "size"
+        col = {"size": 2, "alt": 3, "clear": 4}.get(mode)
+        if col is not None:
+            self.t_table.sortItems(col, Qt.DescendingOrder)
+        else:
+            self.t_table.sortItems(8, Qt.AscendingOrder)
         self.t_table.resizeColumnsToContents()
 
     # ---- live search / filter over the full catalogue --------------------
@@ -10781,6 +11235,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self._burst_autosolved = False        # auto plate-solve the 1st frame of a big burst
             self._sess_hfr = []; self._sess_t0 = time.monotonic()
             self._series_frames = 0
+            self._iv_paused = False
+            self.iv_pause.setEnabled(True); self.iv_pause.setText("⏸ Pause")
             self._set_review_mode(True)
         else:
             self._single_shot = False
@@ -10790,6 +11246,8 @@ class MainWindow(QtWidgets.QMainWindow):
             self._prog_timer.stop()
             self.prog_label.setText("Finished — press Done")
             self.iv_start.setEnabled(True)        # possibility to relaunch a burst
+            self._iv_paused = False
+            self.iv_pause.setEnabled(False); self.iv_pause.setText("⏸ Pause")
             if not getattr(self, "_series_frames", 0):
                 # Nothing was taken (an auto-stop rule fired at once, or the camera
                 # refused): staying in review would show a stale frame with no way out
@@ -13995,6 +14453,11 @@ class MainWindow(QtWidgets.QMainWindow):
 
     @Slot(int, str, str)
     def on_seq_started(self, seq_id, seq_type, mode):
+        # A new series starts its own count: the integration shown is the one you are
+        # gathering now, not everything since the app was launched. Pausing and
+        # resuming keeps it, because that does not start a new sequence.
+        self._seq_counts.clear(); self._seq_integs.clear()
+        self._update_total_integ()
         row = self.seq_table.rowCount()
         self.seq_table.insertRow(row)
         self._seq_rows[seq_id] = row
@@ -14173,7 +14636,7 @@ def main():
             pass
     app.aboutToQuit.connect(_cleanup)
 
-    win.show()
+    win.showMaximized()          # a session screen: use the whole display
     worker.start()
     sys.exit(app.exec())
 
