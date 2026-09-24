@@ -141,6 +141,13 @@ LENS_PROFILES = {
     "Sony FE 35 mm F2.8 ZA": {"fmin": 35, "fmax": 35, "amax": 2.8},
     "Tamron 70-180 mm F2.8 G2": {"fmin": 70, "fmax": 180, "amax": 2.8},
     "Sony FE 50 mm F1.8": {"fmin": 50, "fmax": 50, "amax": 1.8},
+    # Canon EF / EF-S. On a variable-aperture zoom, amax is the widest aperture at the
+    # short end (the camera itself refuses f/4 at 55 mm on the 18-55).
+    "Canon EF-S 18-55 mm f/4-5.6 IS STM": {"fmin": 18, "fmax": 55, "amax": 4.0},
+    "Canon EF-S 24 mm f/2.8 STM": {"fmin": 24, "fmax": 24, "amax": 2.8},
+    "Canon EF 50 mm f/1.8 STM": {"fmin": 50, "fmax": 50, "amax": 1.8},
+    "Canon EF-S 55-250 mm f/4-5.6 IS STM": {"fmin": 55, "fmax": 250, "amax": 4.0},
+    "Canon EF 75-300 mm f/4-5.6 III": {"fmin": 75, "fmax": 300, "amax": 4.0},
     # Telescopes: the aperture is fixed by the glass, so amax IS the focal ratio.
     # 72 mm at 420 mm is f/5.8; the 0.85x reducer shortens it to 357 mm, which at
     # the same 72 mm of aperture is f/5.0 — a full stop and a bit faster, and a
@@ -1213,6 +1220,26 @@ def normalize_to_ref(x, ref_med, ref_mad):
         s = float(np.median(np.abs(ch - m))) + 1e-6
         out[:, :, c] = (ch - m) * (ref_mad[c] / s) + ref_med[c]
     return out
+
+
+# Memory: a 24 MP frame is 72 MB as 8-bit BGR and 288 MB as float32, and every
+# processing step makes a few temporaries of that size. Only the stack and the
+# calibration masters need full resolution; everything shown on screen does not.
+PREVIEW_MAX_SIDE = 2400     # review, star metrics, live-stack display, thumbnails
+STACK_MAX_SIDE = 3000       # JPEG-fallback live stack: the size of a half-size RAW
+THUMB_MAX_SIDE = 480        # Results list icons
+
+
+def _shrink(img, max_side=PREVIEW_MAX_SIDE):
+    """Downscale (INTER_AREA) so the longer side is at most `max_side`; else as-is."""
+    if img is None:
+        return None
+    h, w = img.shape[:2]
+    if max(h, w) <= max_side:
+        return img
+    f = max_side / float(max(h, w))
+    return cv2.resize(img, (max(1, int(round(w * f))), max(1, int(round(h * f)))),
+                      interpolation=cv2.INTER_AREA)
 
 
 def _decode_preview_image(path, full_demosaic=False):
@@ -3784,7 +3811,8 @@ class CameraWorker(QtCore.QThread):
                                flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT,
                                borderValue=0)
         valid = cv2.erode(valid, np.ones((5, 5), np.uint8))   # drop Lanczos edge ringing
-        x = np.clip(x, 0.0, None)
+        del x0
+        np.clip(x, 0.0, None, out=x)
         if self._stack_count > 0:
             try:
                 x = normalize_to_ref(x, self._stack_ref_med, self._stack_ref_mad)
@@ -3797,17 +3825,27 @@ class CameraWorker(QtCore.QThread):
             self._stack_wpx = wv.copy()
             self._stack_count = 1
         else:
+            # Welford update, written in place: at 24 MP every temporary is 288 MB.
             wpx = self._stack_wpx
+            delta = x - self._stack_mean
+            del x
             if self._kappa_enabled and self._stack_count >= 4:
-                sigma = np.sqrt(self._stack_M2 / np.maximum(wpx, 1e-6)[..., None]) + 1e-3
-                out = (np.abs(x - self._stack_mean) > (self._kappa * sigma)) & \
-                    (wpx > 0)[..., None]
-                x = np.where(out, self._stack_mean, x)          # outlier -> current mean
+                thr = self._stack_M2 / np.maximum(wpx, 1e-6)[..., None]
+                np.sqrt(thr, out=thr); thr += 1e-3; thr *= self._kappa   # kappa * sigma
+                out = np.abs(delta) > thr
+                del thr
+                out &= (wpx > 0)[..., None]
+                delta[out] = 0.0                                # outlier -> current mean
+                del out
             wnew = wpx + wv
             coef = np.where(wnew > 0, wv / np.maximum(wnew, 1e-6), 0.0)[..., None]
-            delta = x - self._stack_mean
-            self._stack_mean += coef * delta
-            self._stack_M2 += wv[..., None] * delta * (x - self._stack_mean)
+            step = delta * coef                                 # mean_new - mean
+            self._stack_mean += step
+            np.subtract(delta, step, out=step)                  # x - mean_new
+            step *= delta
+            step *= wv[..., None]
+            self._stack_M2 += step
+            del step, delta
             self._stack_wpx = wnew
             self._stack_count += 1
         # the part of the sky every accepted frame covers (only ever shrinks)
@@ -3824,9 +3862,12 @@ class CameraWorker(QtCore.QThread):
                                                    min(c[2], rect[2]), min(c[3], rect[3]))
         self.stack_ready.emit(self._stack_view(), self._stack_count, self._seq_integ)
 
-    def _stack_view(self):
+    def _stack_view(self, display=True):
         """The stack cropped to the region every frame covered (a copy, safe to hand
-        to the GUI thread). Falls back to the whole frame if the crop looks wrong."""
+        to the GUI thread). Falls back to the whole frame if the crop looks wrong.
+        display=True returns a screen-sized copy; False the full-resolution mean."""
+        fit = (lambda a: _shrink(a).astype(np.float32)) if display else \
+            (lambda a: a.astype(np.float32))
         m = self._stack_mean
         if m is None:
             return None
@@ -3838,9 +3879,9 @@ class CameraWorker(QtCore.QThread):
             if x1 - x0 > 0.6 * w and y1 - y0 > 0.6 * h:
                 x0, y0, x1, y1 = max(x0, 0), max(y0, 0), min(x1, w), min(y1, h)
                 self._stack_view_rect = (x0, y0, x1, y1, w, h)
-                return m[y0:y1, x0:x1].astype(np.float32)
+                return fit(m[y0:y1, x0:x1])
         self._stack_view_rect = (0, 0, w, h, w, h)
-        return m.astype(np.float32)
+        return fit(m)
 
     def _emit_cam_status(self, backend):
         try:
@@ -3878,7 +3919,7 @@ class CameraWorker(QtCore.QThread):
         if self._stack_enabled and self._stack_mean is not None and self._stack_count > 0:
             # emit the raw float (linear) mean; the UI flattens + stretches it once,
             # at full precision, and stores it as an already-processed result.
-            result = self._stack_view()
+            result = self._stack_view(display=False)
         elif self._last_preview is not None:
             result = self._last_preview
         cap = "Burst {} · {} · {} shots · {}".format(
@@ -3975,7 +4016,11 @@ class CameraWorker(QtCore.QThread):
             if self._stack_reset_req:
                 self._stack_reset_req = False
                 self._reset_stack()
-            preview = _decode_preview_image(saved, full_demosaic=self._raw_full)
+            full = _decode_preview_image(saved, full_demosaic=self._raw_full)
+            preview = _shrink(full)
+            # HFR is measured on the preview, reported in full-frame pixels
+            kpx = (max(full.shape[:2]) / float(max(preview.shape[:2]))
+                   if preview is not None else 1.0)
             self._last_preview = preview
             scount, hfr, ecc = -1, 0.0, 0.0
             pgray = None
@@ -3983,7 +4028,7 @@ class CameraWorker(QtCore.QThread):
                 try:
                     pgray = cv2.cvtColor(preview, cv2.COLOR_BGR2GRAY)
                     pstars, scount = detect_stars(pgray)
-                    hfr = _median_hfr(pgray, pstars)
+                    hfr = _median_hfr(pgray, pstars) * kpx
                     ecc = _median_eccentricity(pgray, pstars)
                 except Exception:           # noqa: BLE001
                     scount, hfr, ecc = -1, 0.0, 0.0
@@ -4016,7 +4061,8 @@ class CameraWorker(QtCore.QThread):
                 stack_src = (_decode_linear(saved, half=not self._stack_full)
                              if self._stack_linear else None)
                 if stack_src is None:
-                    stack_src = preview.astype(np.float32)
+                    stack_src = (full if self._stack_full
+                                 else _shrink(full, STACK_MAX_SIDE)).astype(np.float32)
                 if self._apply_darks:                       # subtract dark/bias (camera signal)
                     if self._master_dark is None and self._dark_key is None:
                         self._dark_key = (_read_iso_exif(saved), _read_exposure_exif(saved))
@@ -4033,9 +4079,11 @@ class CameraWorker(QtCore.QThread):
                     if self._master_flat is not None:
                         stack_src = apply_flat(stack_src, self._master_flat)
                 self._accumulate_stack(stack_src)
+                del stack_src
             elif light and self._stack_enabled and not rejected:
                 self.status.emit("⏩ Processing is behind — frame {} saved but not "
                                  "stacked.".format(idx))
+            full = None                        # release the full-size decode early
 
             mode = "bulb{:.0f}s".format(self._bulb_seconds) if self._bulb else "speed"
             self._log_row(idx, os.path.basename(saved), mode,
@@ -9031,7 +9079,8 @@ class MainWindow(QtWidgets.QMainWindow):
             processed = entry[3] if len(entry) > 3 else False
             label = cap + ("  🔭" if annot is not None else "")
             item = QtWidgets.QListWidgetItem(
-                QtGui.QIcon(self._bgr_to_pixmap(self._disp_result(img, processed))), label)
+                QtGui.QIcon(self._bgr_to_pixmap(self._disp_result(
+                    _shrink(img, THUMB_MAX_SIDE), processed))), label)
             item.setTextAlignment(Qt.AlignHCenter | Qt.AlignTop)
             item.setData(Qt.UserRole, idx)
             self.results_list.addItem(item)
@@ -9060,7 +9109,8 @@ class MainWindow(QtWidgets.QMainWindow):
         idx = len(self._results)
         self._results.append((img, caption, None, processed, raw_float))
         item = QtWidgets.QListWidgetItem(
-            QtGui.QIcon(self._bgr_to_pixmap(self._disp_result(img, processed))), caption)
+            QtGui.QIcon(self._bgr_to_pixmap(self._disp_result(
+                _shrink(img, THUMB_MAX_SIDE), processed))), caption)
         item.setTextAlignment(Qt.AlignHCenter | Qt.AlignTop)
         item.setData(Qt.UserRole, idx)
         self.results_list.addItem(item)
@@ -11781,6 +11831,7 @@ class MainWindow(QtWidgets.QMainWindow):
     def on_stack_ready(self, stacked, count, integ):
         if stacked is None:
             return
+        stacked = _shrink(stacked)                                   # screen-sized
         if isinstance(stacked, np.ndarray) and stacked.dtype != np.uint8:
             self._stack_float = stacked                              # linear/float mean
             self._last_capture_bgr = np.clip(stacked, 0, 255).astype(np.uint8)

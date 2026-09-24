@@ -382,14 +382,23 @@ def plan(site, when, focal_mm=200, min_alt=30.0, limit=20,
     n = max(2, int(span / 6) + 1)
     times = night.start + np.linspace(0, span, n) * u.min
     frame = AltAz(obstime=times[np.newaxis, :], location=site.location)  # (1, N)
-    ra1d = u.Quantity([t.coord.ra for t in targets])                    # (M,)
-    dec1d = u.Quantity([t.coord.dec for t in targets])
-    coords1d = SkyCoord(ra=ra1d, dec=dec1d, frame="icrs")
-    coords = coords1d[:, np.newaxis]                                    # (M, 1)
-    aa = coords.transform_to(frame)
-    alt = aa.alt.deg                                                    # (M, N)
+    ra_all = np.array([t.coord.ra.deg for t in targets])
+    dec_all = np.array([t.coord.dec.deg for t in targets])
+    # Transform in chunks: one (M, N) transform makes dozens of full-size float64
+    # temporaries inside astropy (a few hundred MB for the whole NGC/IC list).
+    alt = np.empty((len(targets), n), np.float32)                       # (M, N)
+    az = np.empty_like(alt)
+    CH = 400
+    for s in range(0, len(targets), CH):
+        c = SkyCoord(ra=ra_all[s:s + CH] * u.deg, dec=dec_all[s:s + CH] * u.deg,
+                     frame="icrs")[:, np.newaxis]
+        aa = c.transform_to(frame)
+        alt[s:s + CH] = aa.alt.deg
+        az[s:s + CH] = aa.az.deg
+        del aa, c
+    coords1d = SkyCoord(ra=ra_all * u.deg, dec=dec_all * u.deg, frame="icrs")
     # usable = high enough AND not behind the trees / house of the local horizon
-    ok = (alt >= min_alt) & (alt > horizon_alt(horizon, aa.az.deg))
+    ok = (alt >= min_alt) & (alt > horizon_alt(horizon, az))
     step_h = span / max(n - 1, 1) / 60.0
     seps = coords1d.separation(moon_icrs).deg                           # (M,) vectorisé
 

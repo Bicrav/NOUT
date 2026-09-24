@@ -72,16 +72,42 @@ sudo usermod -aG video $USER     # for an HDMI capture card, then log out and ba
 
 **Windows**
 
-```bat
-.venv\Scripts\pip install -r requirements.txt
-.venv\Scripts\python sony_tether_focus.py
-```
+NOUT needs Linux, because libgphoto2 has no Windows build. On Windows it runs in WSL2
+(Ubuntu), with the camera's USB passed through by
+[usbipd-win](https://github.com/dorssel/usbipd-win). Set it up once:
 
-Tethered capture does not work on Windows: libgphoto2, which talks to the camera, has
-no Windows build. Everything else does — planning, sky map, plate solving, stacking a
-folder of exposures already on disk, lucky imaging, HDMI live view through a capture
-card, and the mount over Wi-Fi. Use `--simulate` to run the app with a simulated
-camera; that is how most of it is tested.
+1. In an **admin** PowerShell, install WSL and usbipd, then reboot and create your
+   Linux user when Ubuntu opens:
+   ```powershell
+   wsl --install -d Ubuntu-24.04
+   winget install dorssel.usbipd-win
+   ```
+2. Give WSL enough RAM: create `%UserProfile%\.wslconfig` containing the lines
+   below, then run `wsl --shutdown`.
+   ```ini
+   [wsl2]
+   memory=6GB
+   swap=4GB
+   ```
+3. Share the camera with WSL. Plug it in and switch it on, then run this in an admin
+   PowerShell (Canon 250D shown; `usbipd list` gives your camera's VID:PID):
+   ```powershell
+   usbipd bind --force --hardware-id 04a9:32e9
+   ```
+4. In Ubuntu, install NOUT:
+   ```bash
+   sudo apt update
+   sudo apt install -y git gphoto2 libgphoto2-dev pkg-config python3-venv libxcb-cursor0
+   git clone https://github.com/Bicrav/NOUT.git ~/NOUT
+   cd ~/NOUT && python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+   ```
+
+Then launch NOUT by double-clicking `NOUT.bat`. It attaches the camera to WSL, starts
+NOUT, and gives the camera back to Windows when NOUT closes. Close EOS Utility or
+Imaging Edge first.
+
+If no window appears, check that WSL can display windows at all:
+`sudo apt install -y x11-apps && xclock`.
 
 ### Optional
 
