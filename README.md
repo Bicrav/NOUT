@@ -72,16 +72,26 @@ sudo usermod -aG video $USER     # for an HDMI capture card, then log out and ba
 
 **Windows**
 
-```bat
-.venv\Scripts\pip install -r requirements.txt
-.venv\Scripts\python sony_tether_focus.py
-```
+NOUT needs Linux, because libgphoto2 has no Windows build. The simplest way to run it
+on Windows is WSL2, and `NOUT.bat` sets it up for you. Double-click it; do not use
+*Run as administrator*. It checks each step, installs only what is missing, then starts
+NOUT:
 
-Tethered capture does not work on Windows: libgphoto2, which talks to the camera, has
-no Windows build. Everything else does — planning, sky map, plate solving, stacking a
-folder of exposures already on disk, lucky imaging, HDMI live view through a capture
-card, and the mount over Wi-Fi. Use `--simulate` to run the app with a simulated
-camera; that is how most of it is tested.
+1. **WSL2.** It asks for administrator rights, then a reboot. Run `NOUT.bat` again afterwards.
+2. **RAM for WSL.** It creates `%UserProfile%\.wslconfig` with memory sized to the PC
+   (at most 8 GB), because WSL crashes on capture without enough RAM. An existing file is
+   left alone.
+3. **Ubuntu 24.04.** Choose a Linux user name and password, then type `exit`.
+4. **[usbipd-win](https://github.com/dorssel/usbipd-win).** It passes the USB camera
+   through to Linux.
+5. **Linux packages, NOUT (`~/NOUT`) and its venv.** sudo asks for your Linux password.
+
+On later runs it only checks, which takes a few seconds, then attaches the camera to
+WSL and launches NOUT. Close EOS Utility or Imaging Edge first.
+
+Other ways to get Linux on a Windows PC are a VirtualBox or VMware virtual machine with
+USB passthrough (give the VM at least 8 GB of RAM), or a dual boot. Then follow the
+Linux steps above.
 
 ### Optional
 
