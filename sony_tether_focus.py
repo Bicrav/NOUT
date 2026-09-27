@@ -480,20 +480,32 @@ def remove_gradient(img, strength=1.0, allow_graxpert=False, graxpert_exe=None):
                 gx_img -= gx_img.min(); gx_img = gx_img / (gx_img.max() + 1e-6) * 255.0
                 return np.clip(gx_img, 0, 255).astype(np.uint8)
             return np.clip(gx_img, 0.0, None)
-    f = img.astype(np.float32)
-    h, w = f.shape[:2]
+    h, w = img.shape[:2]
+    # Fit on a decimated copy. The model is a degree-4 surface read off a 72x108 grid,
+    # so the sky medians it needs survive decimation — while the full-resolution float
+    # copy this used to start with was 288 MB, and the whole function peaked at 1.4 GB
+    # on a 24 Mpx frame, which is what ran machines out of memory.
+    fit_side = 1024
+    if max(h, w) > fit_side:
+        sc = fit_side / float(max(h, w))
+        small = cv2.resize(img, (max(int(w * sc), 32), max(int(h * sc), 32)),
+                           interpolation=cv2.INTER_AREA)
+    else:
+        small = img
+    small = np.asarray(small, np.float32)
+    sh, sw = small.shape[:2]
     ny, nx = 12, 16                                   # background sampling grid
-    ys = np.linspace(0, h, ny + 1).astype(int)
-    xs = np.linspace(0, w, nx + 1).astype(int)
+    ys = np.linspace(0, sh, ny + 1).astype(int)
+    xs = np.linspace(0, sw, nx + 1).astype(int)
     deg = 4                                            # polynomial degree (radial vignette)
     gyN, gxN = 72, 108                                 # coarse grid to evaluate the model on
     yy, xx = np.mgrid[0:gyN, 0:gxN].astype(np.float32)
     xn = xx / (gxN - 1) - 0.5
     yn = yy / (gyN - 1) - 0.5
     terms = [(i, j) for i in range(deg + 1) for j in range(deg + 1 - i)]
-    out = np.empty_like(f)
-    for c in range(f.shape[2]):
-        ch = f[:, :, c]
+    models = []
+    for c in range(small.shape[2]):
+        ch = small[:, :, c]
         cx, cy, cvv = [], [], []
         for iy in range(ny):
             for ix in range(nx):
@@ -504,22 +516,39 @@ def remove_gradient(img, strength=1.0, allow_graxpert=False, graxpert_exe=None):
                 s = float(np.median(np.abs(tile - m))) * 1.4826 + 1e-6
                 bgp = tile[tile < m + 2.0 * s]        # keep sky, drop stars/bright signal
                 cvv.append(float(np.median(bgp)) if bgp.size else m)
-                cx.append((xs[ix] + xs[ix + 1]) * 0.5 / w - 0.5)
-                cy.append((ys[iy] + ys[iy + 1]) * 0.5 / h - 0.5)
+                cx.append((xs[ix] + xs[ix + 1]) * 0.5 / sw - 0.5)
+                cy.append((ys[iy] + ys[iy + 1]) * 0.5 / sh - 0.5)
         cx = np.asarray(cx); cy = np.asarray(cy); cvv = np.asarray(cvv)
         A = np.stack([(cx ** i) * (cy ** j) for i, j in terms], axis=-1)
         coef, *_ = np.linalg.lstsq(A, cvv, rcond=None)
         model_s = np.zeros((gyN, gxN), np.float32)
         for k, (i, j) in enumerate(terms):
             model_s += coef[k] * (xn ** i) * (yn ** j)
+        models.append(model_s)
+    del small
+    # Subtract band by band, so no working array is ever a full picture tall.
+    band = max(64, (1 << 22) // max(w, 1))
+    rows = [(y, min(y + band, h)) for y in range(0, h, band)]
+    resid = np.empty((h, w, len(models)), np.float32)
+    for c, model_s in enumerate(models):
         model = cv2.resize(model_s, (w, h), interpolation=cv2.INTER_LINEAR)
-        out[:, :, c] = ch - float(strength) * model
-    if was_u8:
-        out = np.clip(out, 0.0, None)
-        out -= out.min()
-        out = out / (out.max() + 1e-6) * 255.0
-        return np.clip(out, 0, 255).astype(np.uint8)
-    return out                                         # float: keep sign (symmetric residual)
+        for y0, y1 in rows:
+            np.subtract(img[y0:y1, :, c], float(strength) * model[y0:y1],
+                        out=resid[y0:y1, :, c], dtype=np.float32)
+        del model
+    if not was_u8:
+        return resid                                   # float: keep sign (symmetric residual)
+    # uint8 in, uint8 out: normalise over the whole residual, still band by band
+    np.clip(resid, 0.0, None, out=resid)
+    lo = float(resid.min()); hi = float(resid.max())
+    k = 255.0 / (hi - lo + 1e-6)
+    out = np.empty((h, w, resid.shape[2]), np.uint8)
+    for y0, y1 in rows:
+        t = resid[y0:y1]
+        t -= lo
+        t *= k
+        np.clip(t, 0, 255, out=out[y0:y1], casting="unsafe")
+    return out
 
 
 def _mtf(y, m):
@@ -922,7 +951,7 @@ def align_translation(ref_gray, cur_gray):
     return sx, sy
 
 
-def cosmetic_correct(x, k=6.0):
+def cosmetic_correct(x, k=6.0, inplace=False):
     """Remove hot pixels without darks. A hot photosite lights ONE colour channel of
     one pixel; a star, however small, lights all three. So a pixel is fixed only when
     a single channel spikes far above all its neighbours while the other two stay at
@@ -931,33 +960,93 @@ def cosmetic_correct(x, k=6.0):
         return x
     ring = np.ones((3, 3), np.uint8); ring[1, 1] = 0
     sub = x[::4, ::4]
-    out = x.copy()
-    med, spike, elev = [], [], []
-    for c in range(3):
-        ch = np.ascontiguousarray(x[..., c])
-        s = 1.4826 * float(np.median(np.abs(sub[..., c] - np.median(sub[..., c])))) + 1e-3
-        m = cv2.medianBlur(ch, 3)
-        nmax = cv2.dilate(ch, ring)
-        med.append(m)
-        spike.append((ch - nmax) > k * s)
-        elev.append((ch - m) > 3.0 * s)
-    for c in range(3):
-        o1, o2 = [i for i in range(3) if i != c]
-        hot = spike[c] & ~elev[o1] & ~elev[o2]
-        if hot.any():
-            out[..., c][hot] = med[c][hot]
+    out = x if inplace else x.copy()
+    h = x.shape[0]
+    # The noise scale is a whole-frame statistic, so it is measured once per channel.
+    sig = [1.4826 * float(np.median(np.abs(sub[..., c] - np.median(sub[..., c])))) + 1e-3
+           for c in range(3)]
+    # Everything else is local: a 3x3 median and a 3x3 dilation see one pixel around
+    # them, so the frame is done in bands with a two-row halo, exactly as if done whole.
+    # Held as whole planes, the medians, the neighbour maxima and their differences came
+    # to some 600 MB on a 24 Mpx frame; a band costs a few.
+    band = max(64, (1 << 22) // max(x.shape[1], 1))
+    for y0 in range(0, h, band):
+        y1 = min(y0 + band, h)
+        a, b = max(y0 - 2, 0), min(y1 + 2, h)        # halo, so band edges see context
+        lo, hi = y0 - a, (y1 - a)                    # where the band sits inside the halo
+        med, spike, elev = [], [], []
+        for c in range(3):
+            ch = np.ascontiguousarray(x[a:b, :, c])
+            m = cv2.medianBlur(ch, 3)
+            nmax = cv2.dilate(ch, ring)
+            np.subtract(ch, nmax, out=nmax)          # reuse rather than allocate
+            spike.append(nmax > k * sig[c])
+            med.append(m)
+            np.subtract(ch, m, out=nmax)
+            elev.append(nmax > 3.0 * sig[c])
+        for c in range(3):
+            o1, o2 = [i for i in range(3) if i != c]
+            hot = spike[c][lo:hi] & ~elev[o1][lo:hi] & ~elev[o2][lo:hi]
+            if hot.any():
+                out[y0:y1, :, c][hot] = med[c][lo:hi][hot]
+    return out
+
+
+def total_ram_gb():
+    """How much memory this machine has, or None if it will not say."""
+    try:
+        if sys.platform.startswith("win"):
+            import ctypes
+
+            class MS(ctypes.Structure):
+                _fields_ = [("dwLength", ctypes.c_ulong),
+                            ("dwMemoryLoad", ctypes.c_ulong),
+                            ("ullTotalPhys", ctypes.c_ulonglong),
+                            ("ullAvailPhys", ctypes.c_ulonglong),
+                            ("ullTotalPageFile", ctypes.c_ulonglong),
+                            ("ullAvailPageFile", ctypes.c_ulonglong),
+                            ("ullTotalVirtual", ctypes.c_ulonglong),
+                            ("ullAvailVirtual", ctypes.c_ulonglong),
+                            ("ullAvailExtendedVirtual", ctypes.c_ulonglong)]
+            st = MS(); st.dwLength = ctypes.sizeof(MS)
+            ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(st))
+            return st.ullTotalPhys / 1e9
+        return (os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")) / 1e9
+    except Exception:               # noqa: BLE001
+        return None
+
+
+def to_uint8(a):
+    """Clip to 0..255 and convert, a band at a time.
+
+    np.clip(a, 0, 255).astype(np.uint8) needs a full float copy of the picture before
+    it makes the small one — 288 MB at full resolution, for a result of 72."""
+    if a.dtype == np.uint8:
+        return a
+    h = a.shape[0]
+    out = np.empty(a.shape, np.uint8)
+    band = max(64, (1 << 22) // max(int(np.prod(a.shape[1:])) or 1, 1))
+    for y0 in range(0, h, band):
+        y1 = min(y0 + band, h)
+        np.clip(a[y0:y1], 0, 255, out=out[y0:y1], casting="unsafe")
     return out
 
 
 def detection_gray(x):
     """8-bit image to FIND stars in: background-subtracted and square-root stretched,
     so faint stars (a few ADU in linear light) register instead of rounding to 0."""
-    lum = x.mean(axis=2) if x.ndim == 3 else x
+    # our own buffer either way, so the stretch can be done in it rather than in
+    # three more full-frame temporaries
+    lum = x.mean(axis=2) if x.ndim == 3 else np.array(x, np.float32, copy=True)
     sub = lum[::4, ::4]
     bg = float(np.median(sub))
     s = 1.4826 * float(np.median(np.abs(sub - bg))) + 1e-3
-    y = np.clip((lum - bg) / (40.0 * s), 0.0, 1.0)
-    return (np.sqrt(y) * 255.0).astype(np.uint8)
+    lum -= bg
+    lum /= 40.0 * s
+    np.clip(lum, 0.0, 1.0, out=lum)
+    np.sqrt(lum, out=lum)
+    lum *= 255.0
+    return lum.astype(np.uint8)
 
 
 def _obs_background(f, grid=(16, 24), deg=3, iters=5):
@@ -1202,16 +1291,21 @@ def star_white_balance(f):
     return out
 
 
-def normalize_to_ref(x, ref_med, ref_mad):
+def normalize_to_ref(x, ref_med, ref_mad, inplace=False):
     """Per-channel additive+multiplicative normalisation to a reference frame's sky
     statistics (equalises background level and noise scale across frames) so the mean
-    and sigma-clip rejection behave like a real integration."""
-    out = x.copy()
+    and sigma-clip rejection behave like a real integration.
+
+    `inplace` rewrites the frame given: worth it at full resolution, where the copy
+    alone is 288 MB."""
+    out = x if inplace else x.copy()
     for c in range(out.shape[2]):
         ch = out[:, :, c]
         m = float(np.median(ch))
         s = float(np.median(np.abs(ch - m))) + 1e-6
-        out[:, :, c] = (ch - m) * (ref_mad[c] / s) + ref_med[c]
+        ch -= m
+        ch *= ref_mad[c] / s
+        ch += ref_med[c]
     return out
 
 
@@ -1592,19 +1686,55 @@ class GPhoto2Backend:
         data = cam_file.get_data_and_size()
         return bytes(memoryview(data))
 
-    def _await_file(self, path, timeout):
-        """Wait for the body to announce a new file, and download it."""
+    def _pending_file(self, timeout=2.5):
+        """Has the body written a picture it has not told us about yet?
+
+        Asked before ever triggering a second time. On this body the shutter often
+        fires and only then does the call come back with an error, so a blind retry
+        takes a second picture — two shutter sounds, two frames, one of them left
+        behind on the card."""
         gp = self.gp
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            etype, edata = self.camera.wait_for_event(300)
+            try:
+                etype, edata = self.camera.wait_for_event(250)
+            except Exception:           # noqa: BLE001
+                return None
             if etype == gp.GP_EVENT_FILE_ADDED:
-                root, _ = os.path.splitext(path)
-                _, ext = os.path.splitext(edata.name)
-                dest = root + (ext if ext else ".arw")
-                cam_file = self.camera.file_get(edata.folder, edata.name,
+                return edata
+        return None
+
+    def _fetch(self, fp, path, tries=3):
+        """Download a picture the body has already taken.
+
+        Retried on its own, and on its own only: a transfer that fails is never a
+        reason to take another picture."""
+        gp = self.gp
+        root, _ = os.path.splitext(path)
+        _, ext = os.path.splitext(fp.name)
+        dest = root + (ext if ext else ".arw")
+        last = None
+        for attempt in range(tries):
+            try:
+                cam_file = self.camera.file_get(fp.folder, fp.name,
                                                 gp.GP_FILE_TYPE_NORMAL)
                 cam_file.save(dest)
+                return dest
+            except Exception as e:      # noqa: BLE001
+                last = e
+                time.sleep(0.4)
+        raise last
+
+    def _await_file(self, path, timeout):
+        """Wait for the body to announce a new file, and download it."""
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            fp = self._pending_file(min(0.3, max(deadline - time.monotonic(), 0.01)))
+            if fp is not None:
+                t = time.monotonic()
+                dest = self._fetch(fp, path)
+                self.last_timings = {"expose": t - (deadline - timeout),
+                                     "download": time.monotonic() - t}
                 return dest
         return None
 
@@ -1643,30 +1773,63 @@ class GPhoto2Backend:
         # seconds of stacking between frames leaves events piled up, and the next
         # capture then comes back '[-1] Unspecified error' even though the link is
         # perfectly healthy — measured on this camera.
+        # This loop usually costs a twentieth of a second — but every other frame it
+        # takes near four, because the body is still writing the previous 49 MB to the
+        # card and answers slowly while it does. That wait is not waste: capping it at
+        # 0.8 s to save time killed the USB session after three frames, twice over,
+        # while a generous budget ran sixteen frames clean. So the ceiling here is only
+        # a guard against looping for ever, not a cadence tuning knob.
+        waited, strays = 0.0, 0
         try:
-            while self.camera.wait_for_event(10)[0] != gp.GP_EVENT_TIMEOUT:
-                pass
+            t_drain = time.monotonic()
+            deadline = t_drain + 12.0
+            while True:
+                etype, _edata = self.camera.wait_for_event(10)
+                if etype == gp.GP_EVENT_TIMEOUT:
+                    break
+                if etype == gp.GP_EVENT_FILE_ADDED:
+                    # A picture nobody asked for. The body fired twice for one press,
+                    # which it does when the drive mode is continuous rather than
+                    # single: the press lasts as long as two PTP round trips, which is
+                    # sometimes long enough for a second frame. Measured at two frames
+                    # in eight, and holding the shutter 1.5 s gives three.
+                    strays += 1
+                if time.monotonic() > deadline:
+                    break
+            waited = time.monotonic() - t_drain
         except Exception:               # noqa: BLE001
             pass
-        last = None
+        self.last_drain_s = waited
+        self.last_strays = strays
+        last, fp = None, None
+        t0 = time.monotonic()
         for attempt in range(2):
             try:
                 fp = self.camera.capture(gp.GP_CAPTURE_IMAGE)
-                cam_file = self.camera.file_get(fp.folder, fp.name,
-                                                gp.GP_FILE_TYPE_NORMAL)
-                root, _ = os.path.splitext(path)
-                _, ext = os.path.splitext(fp.name)
-                dest = root + (ext if ext else ".jpg")
-                cam_file.save(dest)
-                return dest
+                break
             except Exception as e:      # noqa: BLE001
                 last = e
-                time.sleep(0.6)         # let the body settle, then ask once more
-        # Still nothing: press/release is the path bulb uses, and it works on
-        # bodies where capture() is fussy.
-        if self._has_widget("bulb") or self._has_widget("eosremoterelease"):
-            return self.capture_trigger(path)
-        raise last
+                # Look for the picture before firing again — the shutter may already
+                # have gone. This is what stops a failed download, or an error that
+                # arrives after the exposure, turning into a second exposure.
+                fp = self._pending_file(2.5)
+                if fp is not None:
+                    break
+                if attempt == 0:
+                    time.sleep(0.6)     # let the body settle, then ask once more
+        expose = time.monotonic() - t0
+        if fp is None:
+            # Still nothing: press/release is the path bulb uses, and it works on
+            # bodies where capture() is fussy.
+            if self._has_widget("bulb") or self._has_widget("eosremoterelease"):
+                return self.capture_trigger(path)
+            raise last
+        t1 = time.monotonic()
+        dest = self._fetch(fp, path)
+        self.last_timings = {"expose": expose, "download": time.monotonic() - t1,
+                             "wait": getattr(self, "last_drain_s", 0.0),
+                             "strays": getattr(self, "last_strays", 0)}
+        return dest
 
     # ----- Bulb (long exposures, timed on software side) ---------------
     def _set_widget(self, name, value):
@@ -2413,6 +2576,20 @@ class SkyWatcherMount:
             getattr(self, "_rate", "sidereal"), self.SIDEREAL_DAY)
         return 360.0 / day
 
+    def commanded_steps_per_s(self):
+        """Steps per second the board is really producing, not the rate we asked for.
+
+        The timer period is an integer number of ticks per step, so the achievable
+        rates sit on a grid: asking for sidereal gets you the nearest rung, which on
+        this board is a few tenths of a percent away. Judging a measurement against
+        the ideal rate therefore flags a perfectly behaving mount as wrong."""
+        per = getattr(self, "_track_period", None)
+        if per and self.freq:
+            return self.freq / float(per)
+        if self.cpr is None:
+            return 0.0
+        return self.cpr * self.tracking_omega() / 360.0
+
     def resume_tracking(self, omega_dps=None):
         if self.cpr is None or self.freq is None:
             self.connect()
@@ -2426,6 +2603,7 @@ class SkyWatcherMount:
                 self._send("G110")                      # low-speed (tracking), forward
                 self._send("I1" + self._hex_lsb(period))
                 self._start_motion()
+                self._track_period = period             # what the rate check judges against
                 return
             except RuntimeError:
                 if attempt:
@@ -2444,6 +2622,7 @@ class SkyWatcherMount:
         self._send("G1" + "1" + d)                      # slew (continuous) mode, direction
         self._send("I1" + self._hex_lsb(period))
         self._start_motion()
+        self._track_period = None                       # no longer a tracking rate
 
     def stop(self):
         if self.cpr is None:
@@ -2675,7 +2854,9 @@ class CameraWorker(QtCore.QThread):
     mount_goto_done = Signal(float)           # emitted after a targeted RA goto completes
     mount_axis1_result = Signal(bool, str, float)  # (ok, message, plate angle to set)
     mount_axis1_progress = Signal(float, float, float)  # (fraction, deg left, s left)
-    mount_track_state = Signal(float, float, float)    # (measured, commanded, cpr) steps/s
+    mount_track_state = Signal(float, float, float, float)
+    # (measured, commanded, cpr, uncertainty) in steps/s — the uncertainty is what
+    # keeps the verdict from crying wolf over its own measurement noise
     movie_ready = Signal(str)                 # emitted with the path of a recorded movie
     failed = Signal(str)
 
@@ -2693,7 +2874,16 @@ class CameraWorker(QtCore.QThread):
         self._done = 0
         self._next_shot = None
         self._paused_at = None         # (next shot time, frames left) while held
-        self._speed_recovery = 1.2   # USB/camera recovery pause after each speed-mode shot
+        # Pause after each speed-mode shot, to let the USB link breathe. It used to be
+        # a flat 1.2 s, from before the PTP event queue was drained before each capture;
+        # with that fixed the pause is dead time on every single frame. So start small
+        # and let the camera itself decide: it grows on a capture error and shrinks
+        # again over a clean run.
+        self._speed_recovery = 0.3
+        self._recovery_min, self._recovery_max = 0.3, 1.5
+        self._clean_run = 0
+        self._strays = 0             # pictures the body took that we never asked for
+        self._stray_warned = False
         self._frame_times = deque(maxlen=8)   # recent durations per shot (for ETA)
         self._save_dir = os.path.expanduser("~/SonyTether")
         # exposure mode
@@ -2835,6 +3025,11 @@ class CameraWorker(QtCore.QThread):
                     self.status.emit("🌅 Auto stop rule « {} » — sequence ended "
                                      "({} shots).".format(stop_reason, self._done))
                 else:
+                    # An interval of 3 s means a picture every 3 s, counted from when
+                    # this one starts. Counting it from the END of the frame instead
+                    # made the real period 3 s PLUS the exposure, the transfer and the
+                    # pause — eight seconds for a setting of three.
+                    shot_started = time.monotonic()
                     try:
                         self._do_capture(backend)
                         self._cap_retries = 0
@@ -2845,6 +3040,10 @@ class CameraWorker(QtCore.QThread):
                             alive = backend.is_alive()
                         except Exception:             # noqa: BLE001
                             alive = False
+                        # the link just showed it needs more room between frames
+                        self._clean_run = 0
+                        self._speed_recovery = min(self._recovery_max,
+                                                   self._speed_recovery * 1.6 + 0.2)
                         if alive and self._cap_retries < 3:
                             # the body still answers: this was a glitch, not a drop
                             self._cap_retries += 1
@@ -2872,7 +3071,7 @@ class CameraWorker(QtCore.QThread):
                             self.msleep(int(self._speed_recovery * 1000))
                         if self._total <= 0:            # unlimited: until manual Stop
                             self._maybe_dither()
-                            self._next_shot = time.monotonic() + self._interval
+                            self._next_shot = self._due(shot_started)
                         else:                           # finite length series
                             self._remaining -= 1
                             self._maybe_dither()
@@ -2883,7 +3082,7 @@ class CameraWorker(QtCore.QThread):
                                 self.status.emit("Intervalometer finished ({} shots).".format(
                                     self._done))
                             else:
-                                self._next_shot = time.monotonic() + self._interval
+                                self._next_shot = self._due(shot_started)
 
             # live view ONLY at idle, if enabled; during intervalometer we
             # give way to the last photo (and save battery + USB bus).
@@ -2973,6 +3172,7 @@ class CameraWorker(QtCore.QThread):
 
     #: Commands that poll the mount for seconds. Nothing here needs to finish
     #: before the next preview frame, so none of them belongs on the camera thread.
+    TRACK_WINDOW_S = 45.0           # how much history the rate is fitted over
     _SLOW_MOUNT = ("mount_connect", "mount_track_start", "mount_track_stop",
                    "mount_set_track_rate", "mount_slew", "mount_slew_stop",
                    "mount_goto_ra", "set_dither")
@@ -3032,8 +3232,15 @@ class CameraWorker(QtCore.QThread):
         elif kind == "mount_slew_stop":
             if self._dither_mount is not None:
                 try:
-                    self._dither_mount.stop()
-                    self.mount_status.emit("⏹ Mount: slew stopped")
+                    if kw.get("resume"):
+                        # letting go of a manual nudge should hand the sky back to the
+                        # motor, not leave the axis parked. resume_tracking stops and
+                        # waits for the axis to settle before it restarts it.
+                        self._dither_mount.resume_tracking()
+                        self.mount_status.emit("⏹ Slew stopped — tracking again")
+                    else:
+                        self._dither_mount.stop()
+                        self.mount_status.emit("⏹ Mount: slew stopped")
                 except Exception as e:      # noqa: BLE001
                     self.mount_status.emit("Mount: stop failed: {}".format(e))
         elif kind == "mount_axis1_sync":
@@ -3090,19 +3297,30 @@ class CameraWorker(QtCore.QThread):
     def _track_probe(self, kw):
         """Measure what the axis is REALLY doing, from the step counter.
 
-        One reading per call, the rate coming from the gap to the previous one —
-        so nothing blocks, and the answer is a measurement rather than a repeat of
-        what was commanded. A mount that silently stopped, or that is tracking at
-        the wrong rate for the target, both show up here and nowhere else."""
+        One reading per call, so nothing blocks — but the rate comes from a straight
+        line fitted through the last three quarters of a minute of readings, not from
+        the gap to the previous one. Two readings two seconds apart cannot support the
+        answer: the Wi-Fi round trip wanders by tens of milliseconds, which is a couple
+        of percent of a two-second window, and the counter itself only moves in whole
+        steps. Fitting a window turns both into noise that averages away, and the
+        scatter around the line becomes the uncertainty the verdict is allowed to use.
+
+        A mount that silently stopped, or one tracking at the wrong rate for the
+        target, still show up here and nowhere else."""
         import time
         m = self._dither_mount
         if m is None or m.cpr is None:
-            self.mount_track_state.emit(float("nan"), 0.0, 0.0)
+            self._track_hist = []
+            self.mount_track_state.emit(float("nan"), 0.0, 0.0, 0.0)
             return
         try:
-            now, counts = time.monotonic(), m.get_counts(retries=0)
+            t0 = time.monotonic()
+            counts = m.get_counts(retries=0)
+            # the reply arrives one round trip after the question: date the reading in
+            # the middle of it, or the link's own jitter is read as a rate change
+            now = 0.5 * (t0 + time.monotonic())
         except Exception:               # noqa: BLE001  (Wi-Fi hiccup: skip this sample)
-            self.mount_track_state.emit(float("nan"), 0.0, 0.0)
+            self.mount_track_state.emit(float("nan"), 0.0, 0.0, 0.0)
             # The 2i's Wi-Fi drops now and then, and a mount that stops answering is
             # usually still tracking — it is the link that died. After ~12 s of
             # silence, reopen it, keeping the step counter so an axis-1 sync survives.
@@ -3116,16 +3334,54 @@ class CameraWorker(QtCore.QThread):
                     self.mount_status.emit("⚠ Mount unreachable: {}".format(e))
             return
         self._probe_fails = 0
-        prev = getattr(self, "_track_sample", None)
-        self._track_sample = (now, counts)
-        if prev is None or now - prev[0] < 1.5:
-            return                      # too short a gap to mean anything yet
-        rate = (counts - prev[1]) / (now - prev[0])
         try:
-            commanded = m.cpr * m.tracking_omega() / 360.0
+            commanded = m.commanded_steps_per_s()
         except Exception:               # noqa: BLE001
             commanded = 0.0
-        self.mount_track_state.emit(rate, commanded, float(m.cpr))
+        hist = getattr(self, "_track_hist", None)
+        if hist is None:
+            hist = self._track_hist = []
+        if hist:
+            gap = max(now - hist[-1][0], 1e-6)
+            inst = (counts - hist[-1][1]) / gap      # what it did since the last reading
+            # A slew or a GoTo runs tens of times faster than tracking. Such a reading
+            # must be reported as what it is, and must never enter the tracking window:
+            # left in, its big displacement divided by a growing window read as a rate
+            # slowly decaying from 70x to 12x long after the axis had settled.
+            if gap > 20.0 or abs(inst) > 3.0 * max(abs(commanded), 1.0):
+                self._track_hist = [(now, counts)]
+                self._was_fast = True
+                if gap <= 20.0:
+                    self.mount_track_state.emit(inst, commanded, float(m.cpr),
+                                                abs(inst) * 0.05)
+                return
+            if getattr(self, "_was_fast", False):
+                # the axis has settled: start the window here, with nothing from before
+                self._was_fast = False
+                self._track_hist = [(now, counts)]
+                return
+        hist.append((now, counts))
+        while len(hist) > 2 and now - hist[0][0] > self.TRACK_WINDOW_S:
+            hist.pop(0)
+        span = hist[-1][0] - hist[0][0]
+        if len(hist) < 3 or span < 6.0:
+            # not enough window yet: answer with the rough two-point rate, and say so
+            # by handing out an uncertainty that matches how rough it is
+            if len(hist) < 2 or span < 1.5:
+                return
+            rate = (hist[-1][1] - hist[0][1]) / span
+            self.mount_track_state.emit(rate, commanded, float(m.cpr),
+                                        max(abs(rate) * 0.03, 1.5 / span))
+            return
+        t = np.array([h[0] for h in hist], float)
+        c = np.array([h[1] for h in hist], float)
+        t -= t.mean()
+        denom = float((t * t).sum()) or 1.0
+        rate = float((t * (c - c.mean())).sum() / denom)
+        resid = (c - c.mean()) - rate * t
+        dof = max(len(t) - 2, 1)
+        sigma = float(np.sqrt((resid * resid).sum() / dof / denom))
+        self.mount_track_state.emit(rate, commanded, float(m.cpr), sigma)
 
     def _set_track_rate(self, kw):
         """Apply the tracking rate a given target actually needs.
@@ -3525,6 +3781,7 @@ class CameraWorker(QtCore.QThread):
                     self._done = 0
                     self._frame_times.clear()
                     self._star_hist.clear()
+                    self._strays = 0; self._stray_warned = False
                     self._reset_stack()              # new stack per series
                     self._init_session_log()      # session CSV log
                     if self._bulb:
@@ -3723,10 +3980,13 @@ class CameraWorker(QtCore.QThread):
         count more. Pixels a frame does not cover get no weight from it, so drift and
         dither leave no mirrored edges; the shown stack is cropped to the part every
         frame covers. Optional kappa-sigma rejection against the running spread."""
-        x0 = frame.astype(np.float32)
+        # The caller hands us a frame it does not keep, so work in it rather than on
+        # a copy: astype() on an array that is already float32 copied 288 MB per frame
+        # for nothing.
+        x0 = frame if frame.dtype == np.float32 else frame.astype(np.float32)
         if x0.ndim == 2:
             x0 = cv2.cvtColor(x0, cv2.COLOR_GRAY2BGR)
-        x0 = cosmetic_correct(x0)
+        x0 = cosmetic_correct(x0, inplace=True)
         h, w = x0.shape[:2]
         gray = detection_gray(x0)
         try:
@@ -3780,35 +4040,66 @@ class CameraWorker(QtCore.QThread):
                 M = np.float32([[1, 0, 0], [0, 1, 0]])
         x = cv2.warpAffine(x0, M, (w, h), flags=cv2.INTER_LANCZOS4,
                            borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-        valid = cv2.warpAffine(np.ones((h, w), np.float32), M, (w, h),
+        del x0                          # 288 MB at full resolution, finished with here
+        # one byte a pixel instead of four: this is a 0/1 mask, not an image
+        valid = cv2.warpAffine(np.ones((h, w), np.uint8), M, (w, h),
                                flags=cv2.INTER_NEAREST, borderMode=cv2.BORDER_CONSTANT,
                                borderValue=0)
         valid = cv2.erode(valid, np.ones((5, 5), np.uint8))   # drop Lanczos edge ringing
-        x = np.clip(x, 0.0, None)
+        np.clip(x, 0.0, None, out=x)
         if self._stack_count > 0:
             try:
-                x = normalize_to_ref(x, self._stack_ref_med, self._stack_ref_mad)
+                x = normalize_to_ref(x, self._stack_ref_med, self._stack_ref_mad,
+                                     inplace=True)     # x is the warp output, ours
             except Exception:           # noqa: BLE001
                 pass
-        wv = valid * wq
+        # Accumulate in horizontal bands. The arithmetic is elementwise, so the result
+        # is identical to doing it in one go, but the half-dozen working arrays are a
+        # band tall instead of a frame tall: at 6000x4000 that is the difference
+        # between a few hundred megabytes and a few gigabytes, which is what made the
+        # app run out of memory on a machine with less of it.
+        band = max(64, (1 << 22) // max(w, 1))
+        rows = [(y, min(y + band, h)) for y in range(0, h, band)]
         if self._stack_mean is None or self._stack_mean.shape != x.shape:
-            self._stack_mean = x * valid[..., None]
-            self._stack_M2 = np.zeros_like(x)
-            self._stack_wpx = wv.copy()
+            self._stack_mean = np.empty_like(x)
+            self._stack_wpx = np.empty((h, w), np.float32)
+            # M2 only feeds kappa-sigma rejection: 288 MB that is pure waste when the
+            # rejection is off, which is why it is allocated on demand.
+            self._stack_M2 = np.zeros_like(x) if self._kappa_enabled else None
+            self._stack_M2_from = 0
+            for y0, y1 in rows:
+                vb = valid[y0:y1].astype(np.float32)
+                vb *= wq
+                np.multiply(x[y0:y1], vb[..., None], out=self._stack_mean[y0:y1])
+                self._stack_wpx[y0:y1] = vb
             self._stack_count = 1
         else:
-            wpx = self._stack_wpx
-            if self._kappa_enabled and self._stack_count >= 4:
-                sigma = np.sqrt(self._stack_M2 / np.maximum(wpx, 1e-6)[..., None]) + 1e-3
-                out = (np.abs(x - self._stack_mean) > (self._kappa * sigma)) & \
-                    (wpx > 0)[..., None]
-                x = np.where(out, self._stack_mean, x)          # outlier -> current mean
-            wnew = wpx + wv
-            coef = np.where(wnew > 0, wv / np.maximum(wnew, 1e-6), 0.0)[..., None]
-            delta = x - self._stack_mean
-            self._stack_mean += coef * delta
-            self._stack_M2 += wv[..., None] * delta * (x - self._stack_mean)
-            self._stack_wpx = wnew
+            if self._kappa_enabled and self._stack_M2 is None:
+                # turned on mid-series: start the spread from here, and say from when,
+                # so rejection waits for it to mean something instead of throwing
+                # everything away against a spread of zero
+                self._stack_M2 = np.zeros_like(self._stack_mean)
+                self._stack_M2_from = self._stack_count
+            reject = (self._kappa_enabled and self._stack_count >= 4
+                      and self._stack_count - getattr(self, "_stack_M2_from", 0) >= 4)
+            for y0, y1 in rows:
+                vb = valid[y0:y1].astype(np.float32)
+                vb *= wq                                  # this band's weight
+                mb = self._stack_mean[y0:y1]
+                wb = self._stack_wpx[y0:y1]
+                xb = x[y0:y1]
+                if reject:
+                    m2b = self._stack_M2[y0:y1]
+                    sigma = np.sqrt(m2b / np.maximum(wb, 1e-6)[..., None]) + 1e-3
+                    bad = (np.abs(xb - mb) > (self._kappa * sigma)) & (wb > 0)[..., None]
+                    xb = np.where(bad, mb, xb)            # outlier -> current mean
+                wnew = wb + vb
+                coef = np.where(wnew > 0, vb / np.maximum(wnew, 1e-6), 0.0)[..., None]
+                delta = xb - mb
+                mb += coef * delta                        # writes through to the stack
+                if self._stack_M2 is not None:
+                    self._stack_M2[y0:y1] += vb[..., None] * delta * (xb - mb)
+                wb[...] = wnew
             self._stack_count += 1
         # the part of the sky every accepted frame covers (only ever shrinks)
         pts = np.float32([[0, 0], [w, 0], [0, h], [w, h]])
@@ -3842,7 +4133,23 @@ class CameraWorker(QtCore.QThread):
         self._stack_view_rect = (0, 0, w, h, w, h)
         return m.astype(np.float32)
 
-    def _emit_cam_status(self, backend):
+    def _due(self, shot_started):
+        """When the next frame is due: one interval after this one began.
+
+        If the frame took longer than the interval — a raw file over USB 2 needs a
+        good three seconds whatever the shutter speed — the next one starts as soon
+        as this one is out of the way, which is as fast as the camera can go."""
+        return max(shot_started + self._interval, time.monotonic())
+
+    def _emit_cam_status(self, backend, force=True):
+        """Battery and free space. Reading them means a full config read over PTP,
+        which costs the better part of a second on this body — far too much to pay on
+        every frame for numbers that move over minutes."""
+        if not force:
+            last = getattr(self, "_cam_status_at", 0.0)
+            if time.monotonic() - last < 20.0:
+                return
+        self._cam_status_at = time.monotonic()
         try:
             info = backend.status_info(self._save_dir)
             free = info.get("free_gb")
@@ -3938,8 +4245,37 @@ class CameraWorker(QtCore.QThread):
             self._frame_times.append(time.monotonic() - t0 + self._interval)
             exp_s = self._bulb_seconds if self._bulb else (backend.current_exposure_s() or 0.0)
             self.capture_saved.emit(saved)
-            self.status.emit("Saved: {}".format(os.path.basename(saved)))
-            self._emit_cam_status(backend)
+            tm = getattr(backend, "last_timings", None) or {}
+            if tm.get("download"):
+                # A frame cycle is mostly transfer, not exposure, and that is invisible
+                # unless it is said: 49 MB of raw over USB 2 takes seconds whatever the
+                # shutter speed is set to.
+                wait = tm.get("wait", 0.0)
+                self.status.emit(
+                    "Saved: {}  ·  {:.1f} s exposure + transfer{}"
+                    .format(os.path.basename(saved), tm.get("expose", 0.0),
+                            ", {:.1f} s waiting for the card".format(wait)
+                            if wait > 1.0 else ""))
+            else:
+                self.status.emit("Saved: {}".format(os.path.basename(saved)))
+            self._last_timings = tm
+            if tm.get("strays"):
+                # Say it rather than drop it quietly: those are exposures the shutter
+                # actually took, and they cost cadence too — the body then has twice
+                # as much to write to the card.
+                self._strays += tm["strays"]
+                if not self._stray_warned:
+                    self._stray_warned = True
+                    self.status.emit(
+                        "⚠ The camera took two pictures for one trigger. Set the drive "
+                        "mode to Single Shooting on the body — in continuous mode it "
+                        "fires twice now and then, which wastes shutter actuations and "
+                        "slows every frame down.")
+            self._clean_run += 1
+            if self._clean_run >= 10 and self._speed_recovery > self._recovery_min:
+                self._speed_recovery = max(self._recovery_min, self._speed_recovery - 0.15)
+                self._clean_run = 0
+            self._emit_cam_status(backend, force=False)
             avg = (sum(self._frame_times) / len(self._frame_times)
                    if self._frame_times else 0.0)
             self.interval_progress.emit(self._done, self._total, avg)
@@ -6479,6 +6815,368 @@ class GeoBortleWorker(QtCore.QThread):
             self.done.emit(None, None, str(e))
 
 
+class MountErrorDialog(QtWidgets.QDialog):
+    """Measure what the mount really does, then say how long an exposure can be.
+
+    A star is followed on the live view for a few worm turns. Its wander splits into
+    two parts: a straight drift, which is what is left of the polar alignment, and a
+    repeating wobble, which is the periodic error of the worm gear. The longest usable
+    exposure then comes straight out of the measured track — for a candidate length,
+    take every pair of samples that far apart and count how many moved less than the
+    trailing you accept. No model, no assumed amplitude."""
+
+    PRESETS = (135, 200, 300, 357, 420, 600, 1050)
+
+    def __init__(self, parent, focal_mm=420.0):
+        super().__init__(parent)
+        self.setWindowTitle("Mount error — measurement and maximum exposure")
+        self.setMinimumWidth(780)
+        self.rec = []                  # (t seconds, x px, y px) on the live view
+        self.recording = False
+        self.scale = None              # arcsec per live-view pixel
+        self._t0 = None
+        self._last_xy = None
+        self._summary = ""
+        v = QtWidgets.QVBoxLayout(self)
+        v.addWidget(_hint(
+            "Point at a star bright enough to be seen on the live view, start tracking, "
+            "and leave the live view running. Then do not touch anything — no focusing, "
+            "no bumping the tripod — for at least two worm turns, about 16 minutes on a "
+            "Star Adventurer.<br><br>"
+            "NOUT follows the star and separates the straight drift (what is left of the "
+            "polar alignment) from the repeating wobble (the worm's periodic error). "
+            "Both decide how long you can expose before stars turn into short lines.<br><br>"
+            "Measure at the focal length you are actually using — the measurement is in "
+            "pixels and NOUT needs that focal to turn it into arcseconds."))
+        row = QtWidgets.QHBoxLayout()
+        row.addWidget(QtWidgets.QLabel("Measured at"))
+        self.focal = QtWidgets.QDoubleSpinBox(); self.focal.setRange(8, 4000)
+        self.focal.setSuffix(" mm"); self.focal.setDecimals(0)
+        self.focal.setValue(float(focal_mm))
+        self.focal.setToolTip("The focal length on the camera during the measurement.")
+        self.focal.valueChanged.connect(self._refocal)
+        row.addWidget(self.focal)
+        row.addSpacing(12)
+        row.addWidget(QtWidgets.QLabel("Duration"))
+        self.dur = QtWidgets.QSpinBox(); self.dur.setRange(2, 60); self.dur.setValue(16)
+        self.dur.setSuffix(" min")
+        self.dur.setToolTip("Two worm turns is the useful minimum; more is better.")
+        row.addWidget(self.dur)
+        row.addStretch(1)
+        self.btn = QtWidgets.QPushButton("● Start the measurement")
+        self.btn.setObjectName("primary")
+        self.btn.clicked.connect(self._toggle)
+        row.addWidget(self.btn)
+        v.addLayout(row)
+
+        self.plot = pg.PlotWidget(); self.plot.setBackground("#0d0d0d")
+        self.plot.setLabel("left", 'star position (")')
+        self.plot.setLabel("bottom", "time (min)")
+        self.plot.showGrid(x=True, y=True, alpha=0.3)
+        self.plot.addLine(y=0, pen=pg.mkPen("#3b4653"))
+        self.plot.setMinimumHeight(210)
+        self.c_pe = self.plot.plot(pen=pg.mkPen("#ff7a29", width=2))
+        self.c_cross = self.plot.plot(pen=pg.mkPen("#38bdf8", width=1))
+        v.addWidget(self.plot, 1)
+        leg = QtWidgets.QLabel("orange: periodic error, drift removed  ·  blue: the other "
+                               "axis  ·  the drift itself is in the numbers below")
+        leg.setObjectName("cap"); v.addWidget(leg)
+
+        self.res = QtWidgets.QLabel("Nothing measured yet.")
+        self.res.setWordWrap(True); self.res.setTextFormat(Qt.RichText)
+        v.addWidget(self.res)
+
+        trow = QtWidgets.QHBoxLayout()
+        trow.addWidget(QtWidgets.QLabel("Maximum exposure at"))
+        self.tfocal = QtWidgets.QDoubleSpinBox(); self.tfocal.setRange(8, 4000)
+        self.tfocal.setSuffix(" mm"); self.tfocal.setDecimals(0)
+        self.tfocal.setValue(float(focal_mm))
+        self.tfocal.setToolTip("The focal length you want to shoot at — it does not have "
+                               "to be the one you measured at.")
+        self.tfocal.valueChanged.connect(self._analyse)
+        trow.addWidget(self.tfocal)
+        trow.addWidget(QtWidgets.QLabel("trailing accepted"))
+        self.tol = QtWidgets.QDoubleSpinBox(); self.tol.setRange(0.5, 6.0)
+        self.tol.setSingleStep(0.5); self.tol.setValue(1.5); self.tol.setSuffix(" px")
+        self.tol.setToolTip("How far a star may travel during one exposure before you "
+                            "call the frame trailed. 1.5 px is strict, 2.5 px is lenient.")
+        self.tol.valueChanged.connect(self._analyse)
+        trow.addWidget(self.tol)
+        trow.addStretch(1)
+        v.addLayout(trow)
+
+        self.table = QtWidgets.QTableWidget(0, 4)
+        self.table.setHorizontalHeaderLabels(
+            ["Exposure", "Frames kept", "Typical movement", ""])
+        self.table.horizontalHeader().setStretchLastSection(True)
+        self.table.verticalHeader().setVisible(False)
+        self.table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.table.setMaximumHeight(200)
+        v.addWidget(self.table)
+        self.byfocal = QtWidgets.QLabel("")
+        self.byfocal.setWordWrap(True); self.byfocal.setTextFormat(Qt.RichText)
+        v.addWidget(self.byfocal)
+
+        foot = QtWidgets.QHBoxLayout()
+        self.load_btn = QtWidgets.QPushButton("Reload the last measurement")
+        self.load_btn.clicked.connect(self._load)
+        foot.addWidget(self.load_btn)
+        foot.addStretch(1)
+        self.save_btn = QtWidgets.QPushButton("Keep this measurement")
+        self.save_btn.setToolTip("Stored with the app, so you can reopen it and read the "
+                                 "maximum exposure for any focal length without measuring "
+                                 "again.")
+        self.save_btn.clicked.connect(self._save); self.save_btn.setEnabled(False)
+        close = QtWidgets.QPushButton("Close"); close.clicked.connect(self.close)
+        foot.addWidget(self.save_btn); foot.addWidget(close)
+        v.addLayout(foot)
+
+        self._tick = QtCore.QTimer(self); self._tick.setInterval(3000)
+        self._tick.timeout.connect(self._analyse)
+        self._load(quiet=True)
+
+    # ---- collecting -------------------------------------------------------
+    def _toggle(self):
+        if self.recording:
+            self.recording = False; self._tick.stop()
+            self.btn.setText("● Start the measurement")
+            self.focal.setEnabled(True); self.dur.setEnabled(True)
+            self._analyse()
+            return
+        self.rec = []; self._t0 = None; self._last_xy = None; self.scale = None
+        self._ref_flux = None; self._flux0 = []
+        self.recording = True
+        self.btn.setText("■ Stop")
+        self.focal.setEnabled(False); self.dur.setEnabled(False)
+        self._tick.start()
+        self.res.setText("Measuring… keep everything still. The first numbers appear "
+                         "after a few seconds; the periodic error needs a full worm turn "
+                         "before it means anything.")
+
+    def feed(self, frame):
+        """One live-view frame: find the star, note where it is."""
+        if not self.recording or frame is None:
+            return
+        try:
+            g = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame
+            h, w = g.shape[:2]
+            if self.scale is None:
+                self.scale = fov_deg(self.focal.value())[0] * 3600.0 / float(w)
+            now = time.monotonic()
+            if self.rec and now - self._t0 - self.rec[-1][0] < 0.45:   # ~2 samples a second
+                return
+            if self._last_xy is None:          # first frame: take the brightest spot
+                gb = cv2.GaussianBlur(g, (0, 0), 1.5)
+                _mn, _mx, _ml, mloc = cv2.minMaxLoc(gb)
+                px, py = float(mloc[0]), float(mloc[1])
+            else:
+                px, py = self._last_xy
+            r = 18
+            x0, y0 = int(round(px)) - r, int(round(py)) - r
+            x0 = max(0, min(x0, w - 2 * r)); y0 = max(0, min(y0, h - 2 * r))
+            win = g[y0:y0 + 2 * r, x0:x0 + 2 * r].astype(np.float32)
+            if win.shape[0] < 2 * r or win.shape[1] < 2 * r:
+                return
+            win -= float(np.median(win))
+            noise = 1.4826 * float(np.median(np.abs(win))) or 1.0
+            peak = float(win.max())
+            if peak < 6.0 * noise:             # cloud, focus lost, someone walked by
+                return
+            win[win < 0.3 * peak] = 0.0        # centroid on the star, not on the sky
+            tot = float(win.sum())
+            if tot <= 0:
+                return
+            ref = getattr(self, "_ref_flux", None)
+            if ref is None:
+                self._flux0 = getattr(self, "_flux0", []) + [tot]
+                if len(self._flux0) >= 20:
+                    self._ref_flux = float(np.median(self._flux0))
+            elif tot < 0.3 * ref:              # what is left is not the star any more
+                return
+            ys, xs = np.mgrid[0:win.shape[0], 0:win.shape[1]]
+            cx = x0 + float((win * xs).sum() / tot)
+            cy = y0 + float((win * ys).sum() / tot)
+            if self._last_xy is not None and math.hypot(cx - px, cy - py) > 8.0:
+                return                         # a jump that big is another star, not tracking
+            self._last_xy = (cx, cy)
+            if self._t0 is None:
+                self._t0 = now
+            self.rec.append((now - self._t0, cx, cy))
+            if (now - self._t0) / 60.0 >= self.dur.value():
+                self._toggle()
+        except Exception:                      # noqa: BLE001 - a bad frame must not stop a run
+            pass
+
+    # ---- analysis ---------------------------------------------------------
+    def _refocal(self):
+        self.tfocal.setValue(self.focal.value())
+        if self.rec:
+            self.scale = None
+            self._analyse()
+
+    @staticmethod
+    def _smooth(y, k=9):
+        """A few seconds of moving average. The mount cannot move that fast, so what is
+        smoothed away is centroid noise, which would otherwise be read as tracking error."""
+        if len(y) < 4 * k:
+            return y
+        pad = np.r_[y[k - 1::-1], y, y[:-k - 1:-1]]
+        return np.convolve(pad, np.ones(k) / k, "same")[k:-k]
+
+    def _track(self):
+        """The measured track in arcseconds, centred and denoised: (t, N×2 array)."""
+        a = np.array(self.rec, float)
+        t = a[:, 0]
+        if self.scale is None:
+            self.scale = fov_deg(self.focal.value())[0] * 3600.0 / 1024.0
+        xy = (a[:, 1:3] - a[:, 1:3].mean(axis=0)) * self.scale
+        xy = np.column_stack([self._smooth(xy[:, 0]), self._smooth(xy[:, 1])])
+        return t, xy
+
+    def _analyse(self):
+        if len(self.rec) < 20:
+            return
+        t, xy = self._track()
+        span_min = (t[-1] - t[0]) / 60.0
+        # a straight line is the polar alignment; what is left over is the worm
+        slope = np.array([np.polyfit(t, xy[:, 0], 1)[0], np.polyfit(t, xy[:, 1], 1)[0]])
+        resid = xy - np.outer(t - t.mean(), slope)
+        resid -= resid.mean(axis=0)
+        _u, _s, vt = np.linalg.svd(resid, full_matrices=False)
+        pe = resid @ vt[0]             # along the worm's own direction
+        cross = resid @ vt[1]
+        self.c_pe.setData(t / 60.0, pe)
+        self.c_cross.setData(t / 60.0, cross)
+        p2p = float(pe.max() - pe.min())
+        rms = float(pe.std())
+        d_ra = float(slope @ vt[0]) * 60.0            # arcsec/min along the worm's axis
+        d_dec = float(slope @ vt[1]) * 60.0           # across it: the polar alignment
+        drift = float(np.hypot(d_ra, d_dec))
+        # tracking about an axis off by 1′ moves a star 0.263″ a minute at worst,
+        # so 1″/min of drift across the axis means roughly 3.8′ of polar error
+        polar = abs(d_dec) * 3.81
+        per = self._period(t, pe)
+        self._summary = (
+            "<b>Periodic error {:.1f}″ peak to peak</b> ({:.1f}″ rms){}"
+            "<br><b>Drift {:.2f}″/min</b> across the axis — a polar alignment off by "
+            "roughly <b>{}</b> — and {:.2f}″/min along it, which is tracking rate rather "
+            "than alignment.<br>{} samples over {:.1f} min"
+            .format(p2p, rms, "" if per is None else ", repeating every {:.0f} s".format(per),
+                    d_dec, "{:.1f}′".format(polar) if polar < 5 else "{:.0f}′".format(polar),
+                    d_ra, len(t), span_min))
+        if span_min < 8:
+            self._summary += ("<br><span style='color:#f59e0b;'>Under 8 minutes the worm "
+                              "has not turned once — the periodic error is still a guess.</span>")
+        if self.scale and p2p < 1.5 * self.scale:
+            self._summary += ("<br><span style='color:#f59e0b;'>The whole wobble is barely "
+                              "one live-view pixel at {:.0f} mm ({:.0f}″ per pixel). Measure "
+                              "at a longer focal length for a number you can trust.</span>"
+                              .format(self.focal.value(), self.scale))
+        self.res.setText(self._summary)
+        self._last = dict(p2p=p2p, rms=rms, drift=drift, dec_drift=d_dec,
+                          ra_drift=d_ra, polar=polar, period=per, minutes=span_min)
+        self._fill_table(t, xy)
+        self.save_btn.setEnabled(not self.recording)
+
+    @staticmethod
+    def _period(t, y):
+        """Dominant period of the wobble, between one and twenty minutes."""
+        try:
+            n = len(t)
+            if n < 60 or t[-1] - t[0] < 240:
+                return None
+            ti = np.linspace(t[0], t[-1], n)
+            yi = np.interp(ti, t, y)
+            yi = yi - yi.mean()
+            m = 8 * n                      # zero padding: the bins are too coarse otherwise
+            sp = np.abs(np.fft.rfft(yi * np.hanning(n), m))
+            fr = np.fft.rfftfreq(m, ti[1] - ti[0])
+            ok = (fr > 1.0 / 1200.0) & (fr < 1.0 / 60.0)
+            if not ok.any():
+                return None
+            f = fr[ok][int(np.argmax(sp[ok]))]
+            return float(1.0 / f) if f > 0 else None
+        except Exception:              # noqa: BLE001
+            return None
+
+    def _max_exposure(self, t, xy, focal, tol_px, want=80.0):
+        """Longest exposure keeping `want` % of the frames under the accepted trailing,
+        read off the measured track: every pair of samples that far apart is one
+        simulated exposure."""
+        px = fov_deg(focal)[0] * 3600.0 / 6000.0      # arcsec per camera pixel
+        tol = tol_px * px
+        rows = []
+        for expo in (2, 3, 5, 8, 10, 15, 20, 30, 45, 60, 90, 120):
+            if expo > (t[-1] - t[0]) / 3.0:
+                break
+            j = np.searchsorted(t, t + expo)
+            keep = j < len(t)
+            if keep.sum() < 10:
+                break
+            d = np.hypot(*(xy[j[keep]] - xy[keep]).T)
+            rows.append((expo, 100.0 * float((d <= tol).mean()), float(np.median(d)), px))
+        best = max([r[0] for r in rows if r[1] >= want], default=0)
+        return rows, best, px
+
+    def _fill_table(self, t, xy):
+        rows, best, px = self._max_exposure(t, xy, self.tfocal.value(), self.tol.value())
+        self.table.setRowCount(len(rows))
+        for i, (expo, good, med, _px) in enumerate(rows):
+            verdict = ("✅ fine" if good >= 80 else
+                       "⚠ one frame in two" if good >= 50 else "❌ trailed")
+            cells = ("{} s".format(expo), "{:.0f} %".format(good),
+                     "{:.1f}″  ({:.1f} px)".format(med, med / px), verdict)
+            for j, txt in enumerate(cells):
+                it = QtWidgets.QTableWidgetItem(txt)
+                if good >= 80:
+                    it.setForeground(QtGui.QColor("#4ade80"))
+                elif good < 50:
+                    it.setForeground(QtGui.QColor("#f87171"))
+                self.table.setItem(i, j, it)
+        parts = []
+        for f in self.PRESETS:
+            _r, b, _p = self._max_exposure(t, xy, f, self.tol.value())
+            parts.append("{:.0f} mm: <b>{}</b>".format(f, "{} s".format(b) if b else "—"))
+        head = ("<b>At {:.0f} mm, expose up to {} s</b> and 4 frames out of 5 stay under "
+                "{:.1f} px of trailing.<br>".format(self.tfocal.value(), best, self.tol.value())
+                if best else
+                "<b>At {:.0f} mm nothing holds, even 2 s.</b> Check the tracking is "
+                "running and that nothing is shaking.<br>".format(self.tfocal.value()))
+        self.byfocal.setText(head + "Same measurement at other focal lengths — " +
+                             " · ".join(parts))
+
+    # ---- keeping it -------------------------------------------------------
+    def _save(self):
+        try:
+            d = dict(self._last)
+            d.update(focal=self.focal.value(), scale=self.scale,
+                     when=datetime.now().strftime("%Y-%m-%d %H:%M"),
+                     track=[[round(r[0], 2), round(r[1], 3), round(r[2], 3)]
+                            for r in self.rec])
+            QtCore.QSettings("NOUT", "NOUT").setValue("mount_error", json.dumps(d))
+            self.res.setText(self._summary + "<br>Kept. Reopen this window any time to "
+                             "read it again.")
+        except Exception as e:         # noqa: BLE001
+            self.res.setText("Could not keep it: {}".format(e))
+
+    def _load(self, quiet=False):
+        raw = QtCore.QSettings("NOUT", "NOUT").value("mount_error", "")
+        try:
+            d = json.loads(raw) if raw else None
+        except Exception:              # noqa: BLE001
+            d = None
+        if not d or not d.get("track"):
+            if not quiet:
+                self.res.setText("No measurement kept yet.")
+            return
+        self.rec = [tuple(r) for r in d["track"]]
+        self.scale = float(d.get("scale") or 0) or None
+        self.focal.blockSignals(True); self.focal.setValue(float(d.get("focal", 420)))
+        self.focal.blockSignals(False)
+        self._analyse()
+        self.res.setText("Measured on {} · ".format(d.get("when", "?")) + self._summary)
+
+
 class ExposureCalcDialog(QtWidgets.QDialog):
     """Estimate the optimal single sub-exposure so sky-background shot noise swamps
     read noise (Glover/SharpCap approach). Values are estimates — the relative
@@ -8169,6 +8867,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.chk_stack_full.toggled.connect(
             lambda on: self.worker.post("set_stack_full", on=on))
         self.chk_stack_full.toggled.connect(self._restretch)
+        self.chk_stack_full.toggled.connect(self._warn_full_res_ram)
         rl.addWidget(self.chk_stack_full)
         self.chk_frame_reject = QtWidgets.QCheckBox("Reject bad frames (clouds / trails / lost tracking)")
         self.chk_frame_reject.setToolTip("During live stacking, skip whole frames whose star "
@@ -11119,6 +11818,9 @@ class MainWindow(QtWidgets.QMainWindow):
         if getattr(self, "_drift_active", False):
             g = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame
             self._update_drift(g)
+        me = getattr(self, "_mount_err_dlg", None)
+        if me is not None and me.recording:
+            me.feed(frame)
         h, w = frame.shape[:2]
         disp = frame.copy()
         # ROI only if sharpness measurement is active
@@ -11782,8 +12484,12 @@ class MainWindow(QtWidgets.QMainWindow):
         if stacked is None:
             return
         if isinstance(stacked, np.ndarray) and stacked.dtype != np.uint8:
+            # let the previous stack go BEFORE allocating anything new: holding both
+            # plus a temporary meant three full-resolution pictures at once
+            self._stack_float = None
+            self._last_capture_bgr = None
             self._stack_float = stacked                              # linear/float mean
-            self._last_capture_bgr = np.clip(stacked, 0, 255).astype(np.uint8)
+            self._last_capture_bgr = to_uint8(stacked)
         else:
             self._stack_float = None
             self._last_capture_bgr = stacked
@@ -13436,13 +14142,36 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         self._open_mount_dialog()
 
-    def _track_verdict(self, measured, commanded, cpr):
+    def _steady(self, key, bad, raise_after=3, clear_after=2):
+        """Only believe a change after it repeats.
+
+        A single reading that falls outside tolerance is usually the link having a
+        bad moment, not the mount changing behaviour, and a warning that appears and
+        vanishes every two seconds is worse than no warning at all."""
+        st = getattr(self, "_steady_state", None)
+        if st is None:
+            st = self._steady_state = {}
+        latched, run = st.get(key, (False, 0))
+        if bad == latched:
+            run = 0                     # nothing to change
+        else:
+            run += 1
+            if run >= (raise_after if bad else clear_after):
+                latched, run = bad, 0   # it has held long enough to be real
+        st[key] = (latched, run)
+        return latched
+
+    def _track_verdict(self, measured, commanded, cpr, sigma=0.0):
         """What the axis is doing, judged against what the target needs.
 
-        Returns (colour, short, headline, detail). The rate is measured off the
-        step counter, so this catches a mount that quietly stopped and a mount
-        tracking at the wrong rate for what you are pointing at — neither of which
-        any 'tracking started' message would."""
+        Returns (colour, short, headline, detail). Two separate questions, which used
+        to be muddled into one: is the axis holding the rate it was given (measured
+        against commanded, within the measurement's own uncertainty), and is that rate
+        the right one for the target (commanded against the ephemeris). Only the second
+        is something you can act on.
+
+        The step counter is the motor's own, driven open loop, so it cannot wobble on
+        its own — anything jittery in here is the measurement, not the mount."""
         import manual_goto
         from datetime import datetime
         if not cpr or measured != measured:             # NaN: nothing to read
@@ -13470,26 +14199,43 @@ class MainWindow(QtWidgets.QMainWindow):
                     "⏸  STOPPED — the axis is not moving",
                     "Nothing is following the sky. Click to start tracking at the "
                     "{} rate.".format(want))
-        off = (ratio / need - 1.0) * 100.0 if need else 0.0
-        detail = ("measured {:.4f}× sidereal, {} wants {:.4f}× — {:+.2f}% off "
-                  "({:.1f} steps/s)".format(ratio, want, need, off, measured))
+        cmd = commanded / sid if commanded else need    # the rung the board settled on
+        # what the measurement can actually resolve: three sigma, never better than the
+        # 0.3% a step counter read over Wi-Fi can honestly claim
+        tol = max(3.0 * sigma / sid, 0.003)
+        slipping = self._steady("slip", abs(ratio - cmd) > tol)
+        # the achievable rates sit on a grid a few tenths of a percent wide, so a
+        # difference that small is the board rounding, not a wrong choice of rate
+        off = (cmd / need - 1.0) * 100.0 if need else 0.0
+        wrong = self._steady("rate", abs(off) > 1.0)
+        detail = ("measured {:.4f}× sidereal ±{:.4f}, commanded {:.4f}×, {} wants "
+                  "{:.4f}× — {:+.2f}% off ({:.1f} steps/s, fitted over {:.0f} s)"
+                  .format(ratio, tol, cmd, want, need, off, measured,
+                          CameraWorker.TRACK_WINDOW_S))
         if want.startswith("planet") and abs(need - 1.0) < 0.002:
             detail += (".  A planet sits so close to the sidereal rate that plain "
                        "sidereal tracking is fine for it")
-        if abs(off) < 0.5:
-            self._track_state_kind = "ok"
-            return ("#4ade80", "🟢  {}".format(want),
-                    "🟢  Tracking — {} rate, {}".format(
-                        want, "as your target needs" if body != "sidereal"
-                        else "as the stars need"), detail)
-        self._track_state_kind = "wrong"
-        return ("#fbbf24", "⚠  {} ≠ {} — click to fix".format(
-                    "sidereal" if abs(ratio - 1.0) < 0.005 else "{:.3f}×".format(ratio), want),
-                "⚠  Tracking, but NOT at the {} rate your target needs".format(want),
-                detail + ".  Click the indicator to apply the {} rate.".format(want))
+        if wrong:
+            self._track_state_kind = "wrong"
+            return ("#fbbf24", "⚠  {} ≠ {} — click to fix".format(
+                        "sidereal" if abs(cmd - 1.0) < 0.005 else "{:.3f}×".format(cmd), want),
+                    "⚠  Tracking, but NOT at the {} rate your target needs".format(want),
+                    detail + ".  Click the indicator to apply the {} rate.".format(want))
+        if slipping:
+            self._track_state_kind = "slip"
+            return ("#fbbf24", "⚠  axis behind its rate",
+                    "⚠  The axis is not holding the rate it was given",
+                    detail + ".  The rate itself is right, so look at the mechanics: "
+                    "a clutch not tight, the counterweight badly out of balance, or "
+                    "the battery running low.")
+        self._track_state_kind = "ok"
+        return ("#4ade80", "🟢  {}".format(want),
+                "🟢  Tracking — {} rate, {}".format(
+                    want, "as your target needs" if body != "sidereal"
+                    else "as the stars need"), detail)
 
-    def _on_track_state(self, measured, commanded, cpr):
-        col, short, head, detail = self._track_verdict(measured, commanded, cpr)
+    def _on_track_state(self, measured, commanded, cpr, sigma=0.0):
+        col, short, head, detail = self._track_verdict(measured, commanded, cpr, sigma)
         self._sb["mount"] = "🔭 " + re.sub(r"^[^\w]+", "", short).strip()
         self._refresh_statusbar()
         pill = getattr(self, "track_pill", None)
@@ -13912,9 +14658,9 @@ class MainWindow(QtWidgets.QMainWindow):
         neg.setToolTip("Hold to rotate the arm (manual slew, outside tracking); release to stop.")
         pos.setToolTip(neg.toolTip())
         neg.pressed.connect(lambda: self.worker.post("mount_slew", ip=_ip(), dir=-1, rate=128))
-        neg.released.connect(lambda: self.worker.post("mount_slew_stop"))
+        neg.released.connect(lambda: self.worker.post("mount_slew_stop", resume=True))
         pos.pressed.connect(lambda: self.worker.post("mount_slew", ip=_ip(), dir=1, rate=128))
-        pos.released.connect(lambda: self.worker.post("mount_slew_stop"))
+        pos.released.connect(lambda: self.worker.post("mount_slew_stop", resume=True))
         row2.addWidget(neg); row2.addWidget(pos)
         v.addLayout(row2)
         row3 = QtWidgets.QHBoxLayout()
@@ -13941,6 +14687,13 @@ class MainWindow(QtWidgets.QMainWindow):
         lbl.setStyleSheet("color:#94a3b8;"); lbl.setWordWrap(True)
         v.addWidget(lbl)
         self._mount_dlg_lbl = lbl
+        errbtn = QtWidgets.QPushButton("📐 Measure the mount error…")
+        errbtn.setToolTip("Follows a star on the live view for a few worm turns, then "
+                          "tells you the periodic error, what is left of the polar "
+                          "alignment, and the longest exposure you can take at any "
+                          "focal length.")
+        errbtn.clicked.connect(self._open_mount_error)
+        v.addWidget(errbtn)
         v.addWidget(QtWidgets.QLabel("Dither trail (RA offset over shots):"))
         dplot = pg.PlotWidget(); dplot.setMaximumHeight(150); dplot.setBackground("#0d0d0d")
         dplot.setLabel("left", "RA offset (\")"); dplot.setLabel("bottom", "shot")
@@ -13954,6 +14707,12 @@ class MainWindow(QtWidgets.QMainWindow):
         self._refresh_dither_plot()
         v.addStretch(1)
         return page
+
+    def _open_mount_error(self):
+        dlg = getattr(self, "_mount_err_dlg", None)
+        if dlg is None:
+            dlg = self._mount_err_dlg = MountErrorDialog(self, self._focal())
+        dlg.show(); dlg.raise_(); dlg.activateWindow()
 
     def _on_dither_point(self, offset, shot):
         self._dither_hist.append((int(shot), float(offset)))
@@ -14121,6 +14880,19 @@ class MainWindow(QtWidgets.QMainWindow):
     def _push_kappa(self, *args):
         self.worker.post("set_kappa", on=self.chk_kappa.isChecked(),
                          kappa=self.kappa_val.value())
+
+    def _warn_full_res_ram(self, on):
+        """Full-resolution live stacking needs some 3 GB while a frame is going through.
+        On a machine that does not have it to spare the app is killed mid-series, which
+        looks like a bug rather than a setting — so say it before that happens."""
+        if not on:
+            return
+        ram = total_ram_gb()
+        if ram is not None and ram < 12.0:
+            self._say("⚠ Full-resolution stacking needs about 3 GB while each frame goes "
+                      "through, and this machine has {:.0f} GB in total. If NOUT closes "
+                      "by itself during a series, untick this — half resolution uses a "
+                      "quarter of the memory.".format(ram), key="ramwarn", min_s=30.0)
 
     def _push_site(self, *args):
         self.worker.post("set_site", lat=self.t_lat.value(), lon=self.t_lon.value())

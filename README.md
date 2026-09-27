@@ -29,7 +29,12 @@ and distance, for visitors.
 
 **Mount** — Star Adventurer 2i over Wi-Fi: tracking rates (sidereal, lunar, solar,
 planetary), motorised slews in RA, dithering between exposures, and a manual GoTo that
-computes both angles for a rig whose axes are read from engraved dials.
+computes both angles for a rig whose axes are read from engraved dials. The rate is
+checked against the axis's own step counter, so a mount that quietly stopped or that is
+tracking at the wrong rate for the target shows up. A measurement follows a star on the
+live view for a few worm turns and reports the periodic error, what is left of the polar
+alignment, and — read straight off the measured track — the longest exposure that stays
+sharp, at any focal length.
 
 **Sky map and planning** — all-sky and framing views, constellations, planets, comets,
 the ISS, survey images as background, a target list ranked for the night with Moon
