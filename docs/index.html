@@ -5,6 +5,8 @@
 <meta name="apple-mobile-web-app-status-bar-style" content="black">
 <meta name="theme-color" content="#0a0a0c">
 <title>NOUT Pointing</title>
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="icon.png">
 <style>
   :root { --bg:#0a0a0c; --fg:#ff8a3d; --dim:#8a4a22; --line:#2a1a12; --hi:#ffb673;
           --ok:#4ade80; --warn:#fbbf24; }
@@ -468,6 +470,12 @@ function tick() {
     + S.lat.toFixed(3) + ", " + S.lon.toFixed(3);
   if (document.querySelector("#s-point").classList.contains("on")) draw_pick();
   if (document.querySelector("#s-align").classList.contains("on")) draw_align();
+}
+// Offline for good: the first visit over the network is enough.
+if ("serviceWorker" in navigator) {
+  window.addEventListener("load", function () {
+    navigator.serviceWorker.register("sw.js").catch(function () {});
+  });
 }
 fill_setup(); draw_list(); tick(); setInterval(tick, 1000);
 setInterval(draw_list, 60000);
