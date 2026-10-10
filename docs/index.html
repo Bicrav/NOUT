@@ -1,0 +1,475 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black">
+<meta name="theme-color" content="#0a0a0c">
+<title>NOUT Pointing</title>
+<style>
+  :root { --bg:#0a0a0c; --fg:#ff8a3d; --dim:#8a4a22; --line:#2a1a12; --hi:#ffb673;
+          --ok:#4ade80; --warn:#fbbf24; }
+  * { box-sizing:border-box; -webkit-tap-highlight-color:transparent; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:15px/1.45 -apple-system,
+         system-ui, "Segoe UI", Roboto, sans-serif;
+         padding:env(safe-area-inset-top) 16px calc(env(safe-area-inset-bottom) + 70px); }
+  h1 { font-size:15px; letter-spacing:.22em; font-weight:600; margin:14px 0 2px;
+       color:var(--hi); }
+  .sub { color:var(--dim); font-size:12px; margin-bottom:10px; }
+  nav { position:fixed; left:0; right:0; bottom:0; display:flex; background:#121014;
+        border-top:1px solid var(--line); padding-bottom:env(safe-area-inset-bottom); }
+  nav button { flex:1; background:none; border:0; color:var(--dim); font-size:13px;
+               padding:13px 0; font-family:inherit; }
+  nav button.on { color:var(--fg); box-shadow:inset 0 2px 0 var(--fg); }
+  section { display:none; } section.on { display:block; }
+  input, select, button.act { width:100%; background:#141118; color:var(--fg);
+        border:1px solid var(--line); border-radius:10px; padding:11px 12px;
+        font-size:16px; font-family:inherit; }
+  button.act { background:#1d1411; font-size:15px; }
+  button.act:active { background:#2a1d17; }
+  button.primary { border-color:var(--fg); color:var(--hi); }
+  .row { display:flex; gap:8px; align-items:center; margin:8px 0; }
+  .card { border:1px solid var(--line); border-radius:12px; padding:12px; margin:10px 0;
+          background:#101016; }
+  .big { font-size:21px; white-space:nowrap; font-weight:700; letter-spacing:.02em; color:var(--hi);
+         text-align:center; font-variant-numeric:tabular-nums; }
+  .cap { color:var(--dim); font-size:11px; text-transform:uppercase;
+         letter-spacing:.14em; text-align:center; }
+  ul { list-style:none; margin:0; padding:0; max-height:34vh; overflow:auto; }
+  li { padding:10px 4px; border-bottom:1px solid var(--line); display:flex;
+       justify-content:space-between; gap:10px; }
+  li small { color:var(--dim); }
+  li.sel { background:#1a1210; }
+  .alt { color:var(--hi); font-variant-numeric:tabular-nums; white-space:nowrap; }
+  .warn { color:var(--warn); } .ok { color:var(--ok); }
+  svg { display:block; margin:0 auto; }
+  .hint { color:var(--dim); font-size:12.5px; }
+  label { color:var(--dim); font-size:12px; }
+</style>
+<h1>N O U T &nbsp;·&nbsp; POINTING</h1>
+<div class="sub" id="clock">—</div>
+
+<section id="s-point" class="on">
+  <div class="row">
+    <input id="q" placeholder="M13, Albireo, 7000…" autocomplete="off"
+           autocorrect="off" spellcheck="false">
+    <select id="kind" style="width:40%">
+      <option value="">all</option><option value="star">stars</option>
+      <option value="Globular">globulars</option><option value="Open">open clusters</option>
+      <option value="Galaxy">galaxies</option><option value="Nebula">nebulae</option>
+    </select>
+  </div>
+  <ul id="list"></ul>
+  <div class="card" id="pick" style="display:none">
+    <div id="pname" style="font-size:17px;font-weight:600"></div>
+    <div class="hint" id="pwhere"></div>
+    <div class="row" style="gap:14px;margin-top:10px">
+      <div style="flex:1"><div class="big" id="d1">—</div>
+        <div class="cap">RA dial · 24 h scale</div></div>
+      <div style="flex:1"><div class="big" id="d2">—</div>
+        <div class="cap">Dec dial · by hand</div></div>
+    </div>
+    <svg id="dial" width="186" height="186" viewBox="0 0 220 220"></svg>
+    <div class="hint" id="pnote"></div>
+    <button class="act primary" id="syncbtn" style="margin-top:10px">
+      I have this one centred — sync the dials</button>
+  </div>
+</section>
+
+<section id="s-align">
+  <div class="card">
+    <div class="cap">Polaris in the polar scope</div>
+    <svg id="reticle" width="240" height="240" viewBox="0 0 240 240"></svg>
+    <div class="big" id="polclock">—</div>
+    <div class="cap" id="polsub">position on the reticle</div>
+    <div class="hint" style="margin-top:10px" id="polnote"></div>
+  </div>
+  <div class="card hint">
+    Put Polaris on the small circle at the position shown, then lock the altitude and
+    azimuth bolts. The drawing is the sky as you see it with the naked eye facing
+    north; a polar scope may turn it round or mirror it, so check the convention once
+    against a known position rather than trusting the drawing.
+  </div>
+</section>
+
+<section id="s-setup">
+  <div class="card">
+    <div class="cap" style="text-align:left">Where you are</div>
+    <div class="row"><label style="width:70px">latitude</label>
+      <input id="lat" type="number" step="0.0001"></div>
+    <div class="row"><label style="width:70px">longitude</label>
+      <input id="lon" type="number" step="0.0001"></div>
+    <button class="act" id="geo">Use my position</button>
+  </div>
+  <div class="card">
+    <div class="cap" style="text-align:left">The dials</div>
+    <div class="hint">What the scale reads when the axis is at hour angle 0 (the
+      meridian) and at declination 0, and which way the numbers run. The direction is
+      the one thing that cannot be worked out on paper — set it by syncing on two
+      stars far apart in hour angle.</div>
+    <div class="row"><label style="width:92px">RA zero (h)</label>
+      <input id="z1" type="number" step="0.001">
+      <select id="g1" style="width:92px"><option value="1">+</option>
+        <option value="-1">−</option></select></div>
+    <div class="row"><label style="width:92px">Dec zero (°)</label>
+      <input id="z2" type="number" step="0.01">
+      <select id="g2" style="width:92px"><option value="1">+</option>
+        <option value="-1">−</option></select></div>
+    <div class="hint" id="calnote"></div>
+    <button class="act" id="twostar" style="margin-top:8px">Two-star sync: use the
+      last two syncs to work out the direction</button>
+  </div>
+  <div class="card">
+    <div class="cap" style="text-align:left">Carry it over to NOUT</div>
+    <div class="hint">The same calibration NOUT keeps. Copy it across either way so
+      both agree.</div>
+    <input id="caljson" style="margin-top:8px" autocomplete="off" spellcheck="false">
+    <div class="row"><button class="act" id="calcopy">Copy</button>
+      <button class="act" id="calload">Load what is in the box</button></div>
+  </div>
+</section>
+
+<nav>
+  <button data-s="point" class="on">Point</button>
+  <button data-s="align">Polar</button>
+  <button data-s="setup">Setup</button>
+</nav>
+
+<script>
+const DATA = {"stars":[["Sirius",101.287,-16.716,-1.46],["Canopus",95.988,-52.696,-0.74],["Arcturus",213.915,19.182,-0.05],["Vega",279.234,38.784,0.03],["Capella",79.172,45.998,0.08],["Rigel",78.634,-8.202,0.13],["Procyon",114.825,5.225,0.34],["Achernar",24.429,-57.237,0.46],["Betelgeuse",88.793,7.407,0.5],["Hadar",210.956,-60.373,0.61],["Altair",297.696,8.868,0.77],["Acrux",186.65,-63.099,0.77],["Aldebaran",68.98,16.509,0.85],["Spica",201.298,-11.161,0.97],["Antares",247.352,-26.432,1.09],["Pollux",116.329,28.026,1.14],["Fomalhaut",344.413,-29.622,1.16],["Deneb",310.358,45.28,1.25],["Mimosa",191.93,-59.689,1.25],["Regulus",152.093,11.967,1.35],["Adhara",104.656,-28.972,1.5],["Castor",113.65,31.888,1.58],["Shaula",263.402,-37.104,1.62],["Gacrux",187.791,-57.113,1.63],["Bellatrix",81.283,6.35,1.64],["Elnath",81.573,28.608,1.65],["Miaplacidus",138.3,-69.717,1.69],["Alnilam",84.053,-1.202,1.69],["Alnitak",85.19,-1.943,1.74],["Alioth",193.507,55.96,1.77],["Dubhe",165.932,61.751,1.79],["Mirfak",51.081,49.861,1.79],["Wezen",107.098,-26.393,1.83],["Kaus Australis",276.043,-34.385,1.85],["Alkaid",206.885,49.313,1.86],["Menkalinan",89.882,44.947,1.9],["Atria",252.166,-69.028,1.91],["Alhena",99.428,16.399,1.93],["Peacock",306.412,-56.735,1.94],["Polaris",37.954,89.264,1.98],["Alphard",141.897,-8.659,1.98],["Hamal",31.793,23.462,2.0],["Diphda",10.897,-17.987,2.04],["Nunki",283.816,-26.297,2.05],["Alpheratz",2.097,29.09,2.06],["Mirach",17.433,35.621,2.07],["Kochab",222.676,74.156,2.07],["Saiph",86.939,-9.67,2.07],["Rasalhague",263.734,12.56,2.08],["Almach",30.975,42.33,2.1],["Denebola",177.265,14.572,2.11],["Algol",47.042,40.956,2.12],["Naos",120.896,-40.003,2.21],["Alphecca",233.672,26.715,2.22],["Sadr",305.557,40.257,2.23],["Eltanin",269.152,51.489,2.23],["Mizar",200.981,54.926,2.23],["Schedar",10.127,56.537,2.24],["Mintaka",83.002,-0.299,2.25],["Caph",2.295,59.15,2.28],["Izar",221.247,27.074,2.35],["Merak",165.46,56.382,2.37],["Enif",326.046,9.875,2.39],["Scheat",345.944,28.083,2.42],["Phecda",178.458,53.695,2.44],["Alderamin",319.645,62.585,2.45],["Markab",346.19,15.205,2.49],["Menkar",45.57,4.09,2.53],["Zubeneschamali",229.252,-9.383,2.61],["Unukalhai",236.067,6.426,2.63],["Sheratan",28.66,20.808,2.64],["Tarazed",296.565,10.613,2.72],["Zubenelgenubi",222.72,-16.042,2.75],["Rastaban",262.608,52.301,2.79],["Algenib",3.309,15.184,2.83],["Cor Caroli",194.007,38.318,2.89],["Sadalsuud",322.89,-5.571,2.9],["Sadalmelik",331.446,-0.32,2.95],["Albireo",292.68,27.96,3.05],["Megrez",183.857,57.033,3.31],["Thuban",211.097,64.376,3.65]],"dso":[["Barnard33","Horsehead Nebula",85.24,-2.46,"Dark nebula",8.0,null],["Coalsack","Coalsack Nebula",186.5,-63.0,"Dark nebula",420.0,null],["Cr399","Coathanger",290.0,20.18,"Asterism",60.0,null],["HCG92","Stephan's Quintet",338.99,33.966,"Galaxy Group",3.5,null],["IC1318","Sadr Region",305.5,40.2,"Nebula",60.0,2.2],["IC1396","Elephant's Trunk Nebula",324.74,57.5,"Nebula",170.0,NaN],["IC1795","Fishhead Nebula",37.5,61.9,"Nebula",30.0,NaN],["IC1805","Heart Nebula",38.2,61.45,"Nebula",100.0,6.5],["IC1848","Soul Nebula",42.79,60.43,"Nebula",100.0,6.5],["IC2118","Witch Head Nebula",76.9,-7.23,"Reflection nebula",180.0,null],["IC2177","Seagull Nebula",105.5,-10.7,"Nebula",120.0,NaN],["IC2944","Running Chicken Nebula",170.5,-63.4,"Nebula",40.0,4.5],["IC405","Flaming Star Nebula",79.1,34.3,"Nebula",37.0,10.0],["IC410","Tadpoles Nebula",83.2,33.43,"Nebula",40.0,NaN],["IC417","Spider Nebula",82.5,34.75,"Nebula",13.0,NaN],["IC434","Horsehead Nebula (IC434)",85.24,-2.46,"Nebula",60.0,11.0],["IC4592","Blue Horsehead Nebula",240.6,-19.8,"Reflection nebula",150.0,3.9],["IC4604","Rho Ophiuchi Nebula",246.4,-23.45,"Reflection nebula",60.0,5.1],["IC4628","Prawn Nebula",247.4,-40.3,"Nebula",60.0,NaN],["IC5070","Pelican Nebula",313.5,44.36,"Nebula",60.0,8.0],["IC5146","Cocoon Nebula",328.38,47.27,"Nebula",12.0,7.2],["LBN438","LBN 438",339.8,40.9,"Reflection nebula",60.0,null],["LDN1235","Shark Nebula",333.4,73.6,"Dark nebula",90.0,null],["M1","Crab Nebula",83.6332,22.0145,"Supernova Remnant",8.0,8.4],["M10","M10",254.2875,-4.0993,"Globular Cluster",9.3,5.0],["M100","M100",185.7285,15.8218,"Galaxy",6.1,9.5],["M101","M101",210.8022,54.3489,"Galaxy",24.0,7.9],["M102","Spindle Galaxy",226.6233,55.7633,"Galaxy",6.5,9.9],["M103","M103",23.3409,60.658,"Open Cluster",4.5,7.4],["M104","Sombrero Galaxy",189.9976,-11.6231,"Galaxy",8.4,8.6],["M105","M105",161.9566,12.5816,"Galaxy",4.9,9.3],["M106","M106",184.7395,47.304,"Galaxy",17.0,9.3],["M107","M107",248.133,-13.0536,"Globular Cluster",7.8,8.8],["M108","M108",167.8791,55.6741,"Galaxy",4.0,10.1],["M109","M109",179.3998,53.3745,"Galaxy",8.1,9.9],["M11","Amas de l'Ecu de Sobieski",282.7749,-6.27,"Open Cluster",9.0,5.8],["M110","M110",10.092,41.6853,"Galaxy",16.2,8.2],["M12","M12",251.8105,-1.9478,"Globular Cluster",11.1,6.1],["M13","Hercules Globular Cluster",250.4235,36.4613,"Globular Cluster",16.5,5.8],["M14","M14",264.4006,-3.2459,"Globular Cluster",9.9,5.7],["M15","M15",322.4932,12.1668,"Globular Cluster",11.1,6.3],["M16","Eagle Nebula",274.7007,-13.8072,"Nebula",120.0,6.0],["M17","Checkmark Nebula",275.1963,-16.1715,"Nebula",12.6,7.0],["M18","M18",274.9936,-17.102,"Open Cluster",6.0,6.9],["M19","M19",255.657,-26.2679,"Globular Cluster",7.5,5.6],["M2","M2",323.3625,-0.8233,"Globular Cluster",8.4,6.2],["M20","Trifid Nebula",270.6754,-22.9719,"Nebula",28.0,8.5],["M21","M21",271.056,-22.4901,"Open Cluster",6.0,5.9],["M22","M22",279.1008,-23.9034,"Globular Cluster",12.6,6.2],["M23","M23",269.2699,-18.9853,"Open Cluster",16.8,5.5],["M24","Small Sgr Star Cloud",274.2339,-18.5146,"Star Association",120.0,4.5],["M25","M25",277.9449,-19.1149,"Open Cluster",14.1,4.6],["M26","M26",281.3277,-9.3836,"Open Cluster",6.0,8.9],["M27","Dumbbell Nebula",299.9016,22.721,"Planetary Nebula",6.7,7.4],["M28","M28",276.1371,-24.8698,"Globular Cluster",5.1,6.9],["M29","M29",305.9907,38.5077,"Open Cluster",3.6,6.6],["M3","M3",205.5468,28.3754,"Globular Cluster",16.2,6.4],["M30","M30",325.0917,-23.1791,"Globular Cluster",9.0,7.1],["M31","Andromeda Galaxy",10.6848,41.2691,"Galaxy",177.8,3.4],["M32","M32",10.6743,40.8653,"Galaxy",7.7,8.1],["M33","Triangulum Galaxy",23.4621,30.6602,"Galaxy",62.1,5.8],["M34","M34",40.5309,42.7461,"Open Cluster",22.5,5.2],["M35","M35",92.2711,24.3386,"Open Cluster",24.0,5.1],["M36","M36",84.0739,34.1407,"Open Cluster",7.2,6.0],["M37","M37",88.0764,32.553,"Open Cluster",11.4,5.6],["M38","M38",82.177,35.8549,"Open Cluster",9.6,6.4],["M39","M39",322.9513,48.4382,"Open Cluster",19.5,4.6],["M4","M4",245.8975,-26.5255,"Globular Cluster",28.2,5.4],["M40","Winnecke 4",185.5875,58.0828,"Double Star",0.8,9.6],["M41","M41",101.4997,-20.7542,"Open Cluster",12.0,4.5],["M42","Great Orion Nebula",83.8186,-5.3897,"Cluster + Nebula",90.0,4.0],["M43","Mairan's Nebula",83.8807,-5.2675,"HII Region",20.0,9.0],["M44","Beehive",130.0924,19.6721,"Open Cluster",108.6,3.1],["M45","Pleiades",56.7499,24.1167,"Open Cluster",110.0,1.6],["M46","M46",115.4451,-14.81,"Open Cluster",21.0,6.1],["M47","M47",114.1459,-14.4826,"Open Cluster",19.8,4.4],["M48","M48",123.4299,-5.7504,"Open Cluster",28.2,5.8],["M49","M49",187.4448,8.0005,"Galaxy",10.2,8.3],["M5","M5",229.6407,2.0827,"Globular Cluster",15.0,6.0],["M50","M50",105.6687,-8.364,"Open Cluster",14.1,5.9],["M51","Whirlpool Galaxy",202.4695,47.1952,"Galaxy",13.7,8.4],["M52","M52",351.2016,61.5932,"Open Cluster",9.9,6.9],["M53","M53",198.2301,18.1691,"Globular Cluster",9.0,7.8],["M54","M54",283.7637,-30.4785,"Globular Cluster",5.1,7.7],["M55","M55",294.9975,-30.9621,"Globular Cluster",12.0,6.5],["M56","M56",289.1479,30.1845,"Globular Cluster",5.8,8.4],["M57","Ring Nebula",283.3959,33.0286,"Planetary Nebula",1.3,8.8],["M58","M58",189.4314,11.8182,"Galaxy",5.0,10.3],["M59","M59",190.5093,11.647,"Galaxy",4.5,9.6],["M6","Butterfly Cluster",265.0864,-32.2542,"Open Cluster",15.6,4.2],["M60","M60",190.9165,11.5527,"Galaxy",6.8,8.8],["M61","M61",185.4787,4.4736,"Galaxy",6.9,10.2],["M62","M62",255.3025,-30.1124,"Globular Cluster",7.8,7.4],["M63","Sunflower Galaxy",198.9555,42.0293,"Galaxy",11.8,8.6],["M64","Black Eye Galaxy",194.1819,21.683,"Galaxy",10.5,8.5],["M65","M65",169.7329,13.0924,"Galaxy",7.6,9.3],["M66","M66",170.0623,12.9915,"Galaxy",10.3,8.9],["M67","M67",132.8338,11.8119,"Open Cluster",33.0,6.9],["M68","M68",189.8667,-26.743,"Globular Cluster",6.6,8.0],["M69","M69",277.8468,-32.348,"Globular Cluster",5.7,8.3],["M7","Ptolemy's Cluster",268.4632,-34.7928,"Open Cluster",22.2,3.3],["M70","M70",280.8027,-32.2919,"Globular Cluster",6.6,9.1],["M71","M71",298.4421,18.7784,"Globular Cluster",6.9,6.1],["M72","M72",313.3663,-12.5371,"Globular Cluster",4.5,9.0],["M73","M73",314.7331,-12.6355,"Other",0.0,8.9],["M74","M74",24.174,15.7837,"Galaxy",9.9,9.3],["M75","M75",301.5201,-21.9222,"Globular Cluster",3.6,8.3],["M76","Barbell Nebula",25.582,51.5755,"Planetary Nebula",1.1,10.1],["M77","M77",40.6696,-0.0133,"Galaxy",6.1,9.3],["M78","M78",86.6908,0.0793,"Reflection Nebula",4.5,8.0],["M79","M79",81.0441,-24.5242,"Globular Cluster",7.2,8.2],["M8","Lagoon Nebula",270.9219,-24.3802,"Nebula",45.0,5.8],["M80","M80",244.2604,-22.9751,"Globular Cluster",5.7,7.3],["M81","Bode's Galaxy",148.8882,69.0653,"Galaxy",21.6,6.9],["M82","Cigar Galaxy",148.9696,69.6794,"Galaxy",11.0,8.3],["M83","Southern Pinwheel Galaxy",204.2539,-29.8654,"Galaxy",13.6,7.2],["M84","M84",186.2656,12.887,"Galaxy",7.4,9.8],["M85","M85",186.3504,18.1915,"Galaxy",7.0,9.1],["M86","M86",186.5488,12.9462,"Galaxy",11.5,8.9],["M87","Virgo Galaxy",187.706,12.3911,"Galaxy",7.1,9.0],["M88","M88",187.9965,14.4204,"Galaxy",8.7,10.3],["M89","M89",188.9158,12.5563,"Galaxy",8.1,10.1],["M9","M9",259.7991,-18.5162,"Globular Cluster",6.9,8.4],["M90","M90",189.2074,13.1629,"Galaxy",9.1,9.5],["M91","M91",188.8602,14.4963,"Galaxy",5.5,11.0],["M92","M92",259.2802,43.1365,"Globular Cluster",14.4,6.5],["M93","M93",116.1217,-23.8531,"Open Cluster",15.0,6.2],["M94","M94",192.721,41.1204,"Galaxy",7.7,8.2],["M95","M95",160.9903,11.7038,"Galaxy",7.2,9.8],["M96","M96",161.6905,11.8199,"Galaxy",8.3,9.2],["M97","Owl Nebula",168.6988,55.019,"Planetary Nebula",3.6,9.9],["M98","M98",183.4512,14.9003,"Galaxy",11.0,10.8],["M99","Coma Pinwheel",184.7067,14.4165,"Galaxy",5.0,9.8],["Mel111","Coma Star Cluster",186.0,26.0,"Open cluster",275.0,null],["Mel20","Alpha Persei Cluster",52.07,49.86,"Open cluster",185.0,null],["Mel25","Hyades",66.75,15.87,"Open cluster",330.0,null],["NGC7320","Stephan's Quintet",338.99,33.966,"Galaxy Group",3.5,13.0],["OU4","Squid Nebula",313.9,59.6,"Nebula",60.0,null],["Sh2-101","Tulip Nebula",299.97,35.27,"Nebula",16.0,null],["Sh2-112","Sh2-112",311.3,45.65,"Nebula",15.0,null],["Sh2-115","Sh2-115",312.5,44.2,"Nebula",30.0,null],["Sh2-129","Flying Bat Nebula",314.0,59.6,"Nebula",90.0,null],["Sh2-132","Lion Nebula",333.6,56.0,"Nebula",30.0,null],["Sh2-155","Cave Nebula",344.6,62.6,"Nebula",50.0,null],["Sh2-157","Lobster Claw Nebula",345.4,61.3,"Nebula",60.0,null],["Sh2-188","Shrimp Nebula",27.4,58.5,"Planetary nebula",10.0,null],["Sh2-216","Sh2-216",69.5,46.7,"Planetary nebula",100.0,null],["Sh2-240","Spaghetti Nebula",84.0,28.0,"Supernova remnant",200.0,null],["Sh2-279","Running Man Nebula",83.85,-4.83,"Reflection nebula",20.0,null],["Sh2-308","Dolphin Head Nebula",103.0,-23.97,"Nebula",40.0,null],["vdB141","Ghost Nebula",315.4,68.16,"Reflection nebula",20.0,null],["vdB152","vdB 152",330.8,69.1,"Reflection nebula",10.0,null]]};
+</script>
+<script>
+// ---- the same maths as manual_goto.py, ported verbatim ----------------------
+function julianDay(d) {                      // d: JS Date, used as UTC
+  let y = d.getUTCFullYear(), m = d.getUTCMonth() + 1;
+  const day = d.getUTCDate();
+  const frac = (d.getUTCHours() + d.getUTCMinutes() / 60
+                + (d.getUTCSeconds() + d.getUTCMilliseconds() / 1000) / 3600) / 24;
+  if (m <= 2) { y -= 1; m += 12; }
+  const a = Math.floor(y / 100), b = 2 - a + Math.floor(a / 4);
+  return Math.floor(365.25 * (y + 4716)) + Math.floor(30.6001 * (m + 1))
+         + day + b - 1524.5 + frac;
+}
+function lstDeg(d, lonEast) {
+  const t = julianDay(d) - 2451545.0;
+  const gmst = 280.46061837 + 360.98564736629 * t;
+  return ((gmst + lonEast) % 360 + 360) % 360;
+}
+function precessFromJ2000(raDeg, decDeg, d) {
+  const t = (julianDay(d) - 2451545.0) / 36525.0;
+  const as2r = Math.PI / (180 * 3600);
+  const zeta = (2306.2181 * t + 0.30188 * t * t + 0.017998 * t ** 3) * as2r;
+  const z = (2306.2181 * t + 1.09468 * t * t + 0.018203 * t ** 3) * as2r;
+  const th = (2004.3109 * t - 0.42665 * t * t - 0.041833 * t ** 3) * as2r;
+  const ra0 = raDeg * Math.PI / 180, dec0 = decDeg * Math.PI / 180;
+  const A = Math.cos(dec0) * Math.sin(ra0 + zeta);
+  const B = Math.cos(th) * Math.cos(dec0) * Math.cos(ra0 + zeta)
+            - Math.sin(th) * Math.sin(dec0);
+  const C = Math.sin(th) * Math.cos(dec0) * Math.cos(ra0 + zeta)
+            + Math.cos(th) * Math.sin(dec0);
+  const ra = ((Math.atan2(A, B) + z) * 180 / Math.PI % 360 + 360) % 360;
+  const dec = Math.asin(Math.max(-1, Math.min(1, C))) * 180 / Math.PI;
+  return [ra, dec];
+}
+function radecToAltaz(haDeg, decDeg, latDeg) {
+  const ha = haDeg * Math.PI / 180, dec = decDeg * Math.PI / 180,
+        lat = latDeg * Math.PI / 180;
+  const sinAlt = Math.sin(dec) * Math.sin(lat)
+                 + Math.cos(dec) * Math.cos(lat) * Math.cos(ha);
+  const alt = Math.asin(Math.max(-1, Math.min(1, sinAlt))) * 180 / Math.PI;
+  const y = -Math.cos(dec) * Math.cos(lat) * Math.sin(ha);
+  const x = Math.sin(dec) - Math.sin(alt * Math.PI / 180) * Math.sin(lat);
+  const az = ((Math.atan2(y, x) * 180 / Math.PI) % 360 + 360) % 360;
+  return [alt, az];
+}
+function wrap180(a) { return ((a + 180) % 360 + 360) % 360 - 180; }
+
+// ---- the dial model: reading = zero + sign * sky / scale --------------------
+const UNIT_SCALE = { hours: 15.0, degrees: 1.0 };
+const UNIT_SPAN = { hours: 24.0, degrees: 360.0 };
+function dialReading(cal, skyDeg) {
+  const r = cal.zero + cal.sign * (skyDeg / UNIT_SCALE[cal.units]);
+  return cal.wrap ? ((r % UNIT_SPAN[cal.units]) + UNIT_SPAN[cal.units])
+                    % UNIT_SPAN[cal.units] : r;
+}
+function dialSync(cal, skyDeg, reading) {      // one point: keeps sign, solves zero
+  let z = reading - cal.sign * (skyDeg / UNIT_SCALE[cal.units]);
+  cal.zero = cal.wrap ? ((z % UNIT_SPAN[cal.units]) + UNIT_SPAN[cal.units])
+                        % UNIT_SPAN[cal.units] : z;
+  return cal.zero;
+}
+function dialSync2(cal, p1, p2) {              // two points: solves sign AND zero
+  const sc = UNIT_SCALE[cal.units], span = UNIT_SPAN[cal.units];
+  let ds = (p2[0] - p1[0]) / sc, dr = p2[1] - p1[1];
+  if (cal.wrap) {
+    ds = wrap180(ds * sc) / sc;
+    dr = ((dr + span / 2) % span + span) % span - span / 2;
+  }
+  if (Math.abs(ds) < 1e-6) return null;
+  cal.sign = (dr / ds) >= 0 ? 1 : -1;
+  dialSync(cal, p1[0], p1[1]);
+  let resid = dialReading(cal, p2[0]) - p2[1];
+  if (cal.wrap) resid = ((resid + span / 2) % span + span) % span - span / 2;
+  return resid * sc;                           // residual in degrees of sky
+}
+function dialFmt(cal, reading) {
+  if (cal.units === "hours") {
+    let r = ((reading % 24) + 24) % 24;
+    let h = Math.floor(r), m = (r - h) * 60;
+    if (m >= 59.95) { h = (h + 1) % 24; m = 0; }
+    return String(h).padStart(2, "0") + " h " + m.toFixed(1).padStart(4, "0") + " m";
+  }
+  return cal.wrap ? (((reading % 360) + 360) % 360).toFixed(1) + "°"
+                  : (reading >= 0 ? "+" : "") + reading.toFixed(1) + "°";
+}
+
+// ---- what to set on the two dials for a target ------------------------------
+function solveTarget(raJ2000, decJ2000, when, site, cal) {
+  const [raD, decD] = precessFromJ2000(raJ2000, decJ2000, when);
+  const lst = lstDeg(when, site.lon);
+  const ha = wrap180(lst - raD);
+  const [alt, az] = radecToAltaz(ha, decD, site.lat);
+  const r1 = dialReading(cal.axis1, ha), r2 = dialReading(cal.axis2, decD);
+  return { raDate: raD, decDate: decD, lst: lst, ha: ha, alt: alt, az: az,
+           r1: r1, r2: r2, t1: dialFmt(cal.axis1, r1), t2: dialFmt(cal.axis2, r2) };
+}
+
+// ---- Polaris around the pole, for the polar scope ---------------------------
+const POLARIS_J2000 = [37.95456, 89.26411];
+function polarisState(when, lonEast) {
+  const [raD, decD] = precessFromJ2000(POLARIS_J2000[0], POLARIS_J2000[1], when);
+  const ha = wrap180(lstDeg(when, lonEast) - raD) / 15.0;        // hours
+  const pdist = 90.0 - decD;                                     // degrees
+  const clock = ((-ha / 2.0) % 12 + 12) % 12;                    // clock hours
+  return { ha: ha, pdist: pdist, clock: clock };
+}
+
+</script>
+<script>
+// ---------------- state, kept on the phone ---------------------------------
+const DEF = { lat: 48.8566, lon: 2.3522,
+  axis1: { units: "hours", zero: 0, sign: -1, wrap: true },
+  axis2: { units: "degrees", zero: 90, sign: -1, wrap: false } };
+let S = Object.assign({}, DEF);
+try { S = Object.assign(S, JSON.parse(localStorage.getItem("nout.point") || "{}")); }
+catch (e) { /* first run, or storage blocked */ }
+let syncs = [];                       // the last two (sky angle, reading) pairs, axis 1
+let sel = null;
+
+function save() {
+  try { localStorage.setItem("nout.point", JSON.stringify(S)); } catch (e) {}
+}
+const $ = (id) => document.getElementById(id);
+
+// ---------------- the list -------------------------------------------------
+function rows() {
+  const now = new Date(), out = [];
+  const kind = $("kind").value, q = $("q").value.trim().toLowerCase();
+  const push = (id, name, ra, dec, extra, isStar) => {
+    if (kind === "star" && !isStar) return;
+    if (kind && kind !== "star" && (extra.type || "").indexOf(kind) < 0) return;
+    if (q && (id + " " + name).toLowerCase().indexOf(q) < 0) return;
+    const [raD, decD] = precessFromJ2000(ra, dec, now);
+    const ha = wrap180(lstDeg(now, S.lon) - raD);
+    const [alt, az] = radecToAltaz(ha, decD, S.lat);
+    out.push({ id, name, ra, dec, alt, az, extra, isStar });
+  };
+  DATA.stars.forEach((s) => push(s[0], s[0], s[1], s[2], { mag: s[3] }, true));
+  DATA.dso.forEach((d) => push(d[0], d[1], d[2], d[3],
+                               { type: d[4], size: d[5], mag: d[6] }, false));
+  out.sort((a, b) => b.alt - a.alt);
+  return out;
+}
+function draw_list() {
+  const ul = $("list"); ul.innerHTML = "";
+  rows().filter((r) => r.alt > 0).slice(0, 80).forEach((r) => {
+    const li = document.createElement("li");
+    const bits = [];
+    if (r.extra.mag != null) bits.push("mag " + r.extra.mag.toFixed(1));
+    if (r.extra.size) bits.push(Math.round(r.extra.size) + "'");
+    if (r.extra.type) bits.push(r.extra.type.toLowerCase());
+    li.innerHTML = "<span>" + r.id
+      + (r.name && r.name !== r.id ? " <small>" + r.name + "</small>" : "")
+      + "<br><small>" + bits.join(" · ") + "</small></span>"
+      + "<span class='alt'>" + Math.round(r.alt) + "°</span>";
+    li.onclick = () => { sel = r; draw_pick(); 
+                         [...ul.children].forEach(c => c.classList.remove("sel"));
+                         li.classList.add("sel"); };
+    ul.appendChild(li);
+  });
+}
+
+// ---------------- the chosen object ----------------------------------------
+function compass(az) {
+  return ["N", "NNE", "NE", "ENE", "E", "ESE", "SE", "SSE", "S", "SSW", "SW", "WSW",
+          "W", "WNW", "NW", "NNW"][Math.round(az / 22.5) % 16];
+}
+function draw_pick() {
+  if (!sel) return;
+  const now = new Date();
+  const r = solveTarget(sel.ra, sel.dec, now, S, S);
+  $("pick").style.display = "block";
+  $("pname").textContent = sel.name && sel.name !== sel.id
+    ? sel.id + " — " + sel.name : sel.id;
+  $("pwhere").textContent = Math.round(r.alt) + "° high, " + compass(r.az)
+    + " (" + Math.round(r.az) + "°)   ·   hour angle "
+    + (r.ha / 15).toFixed(2) + " h";
+  $("d1").textContent = r.t1;
+  $("d2").textContent = r.t2;
+  $("pnote").innerHTML = r.alt < 0
+    ? "<span class='warn'>Below the horizon.</span>"
+    : (r.alt < 15 ? "<span class='warn'>Low — haze and refraction.</span>"
+                  : "Line the RA scale up on the reading above, then set the "
+                    + "declination by hand.");
+  dial_svg(r.r1, r.r2);
+}
+function dial_svg(r1, r2) {
+  const R = 92, cx = 110, cy = 110, p = [];
+  for (let h = 0; h < 24; h++) {
+    const a = (h / 24) * 2 * Math.PI - Math.PI / 2;
+    const l = h % 2 === 0 ? 11 : 6;
+    p.push("<line x1=" + (cx + (R - l) * Math.cos(a)).toFixed(1)
+      + " y1=" + (cy + (R - l) * Math.sin(a)).toFixed(1)
+      + " x2=" + (cx + R * Math.cos(a)).toFixed(1)
+      + " y2=" + (cy + R * Math.sin(a)).toFixed(1)
+      + " stroke='#5a3620' stroke-width='" + (h % 2 ? 1 : 1.6) + "'/>");
+    if (h % 2 === 0) {
+      p.push("<text x=" + (cx + (R - 24) * Math.cos(a)).toFixed(1)
+        + " y=" + (cy + (R - 24) * Math.sin(a) + 4).toFixed(1)
+        + " fill='#8a4a22' font-size='10' text-anchor='middle'>" + h + "</text>");
+    }
+  }
+  const a1 = (((r1 % 24) + 24) % 24 / 24) * 2 * Math.PI - Math.PI / 2;
+  p.push("<circle cx=" + cx + " cy=" + cy + " r=" + R
+         + " fill='none' stroke='#2a1a12'/>");
+  p.push("<line x1=" + cx + " y1=" + cy
+    + " x2=" + (cx + R * Math.cos(a1)).toFixed(1)
+    + " y2=" + (cy + R * Math.sin(a1)).toFixed(1)
+    + " stroke='#ff8a3d' stroke-width='2.5'/>");
+  p.push("<circle cx=" + (cx + R * Math.cos(a1)).toFixed(1)
+    + " cy=" + (cy + R * Math.sin(a1)).toFixed(1)
+    + " r='5' fill='#ffb673'/>");
+  $("dial").innerHTML = p.join("");
+}
+
+// ---------------- polar alignment ------------------------------------------
+function draw_align() {
+  const now = new Date(), p = polarisState(now, S.lon);
+  const R = 96, cx = 120, cy = 120;
+  const ang = (p.clock / 12) * 2 * Math.PI - Math.PI / 2;   // 0 h at the top
+  const rr = R * 0.62;
+  const o = ["<circle cx=120 cy=120 r=" + R + " fill='none' stroke='#2a1a12'/>",
+             "<circle cx=120 cy=120 r=" + rr + " fill='none' stroke='#3a2416'"
+             + " stroke-dasharray='3 4'/>",
+             "<line x1=120 y1=14 x2=120 y2=226 stroke='#20150f'/>",
+             "<line x1=14 y1=120 x2=226 y2=120 stroke='#20150f'/>",
+             "<circle cx=120 cy=120 r='3' fill='#8a4a22'/>",
+             "<text x=120 y=12 fill='#8a4a22' font-size='10' text-anchor='middle'>0 h</text>",
+             "<text x=120 y=236 fill='#8a4a22' font-size='10' text-anchor='middle'>6 h</text>"];
+  o.push("<circle cx=" + (cx + rr * Math.cos(ang)).toFixed(1)
+    + " cy=" + (cy + rr * Math.sin(ang)).toFixed(1)
+    + " r='7' fill='none' stroke='#ff8a3d' stroke-width='2'/>");
+  o.push("<circle cx=" + (cx + rr * Math.cos(ang)).toFixed(1)
+    + " cy=" + (cy + rr * Math.sin(ang)).toFixed(1) + " r='2.5' fill='#ffb673'/>");
+  $("reticle").innerHTML = o.join("");
+  $("polclock").textContent = p.clock.toFixed(2).replace(".", " h ") + " m".slice(0, 0)
+    + "";
+  const h = Math.floor(p.clock), m = Math.round((p.clock - h) * 60);
+  $("polclock").textContent = h + " h " + String(m).padStart(2, "0");
+  $("polsub").textContent = "on the reticle clock  ·  " + (p.pdist * 60).toFixed(1)
+    + "' from the pole";
+  $("polnote").textContent = "Polaris is " + (p.pdist * 60).toFixed(1)
+    + " arcminutes from the true pole tonight, and that distance shrinks by about "
+    + "0.3' a year — a reticle engraved years ago is already out.";
+}
+
+// ---------------- syncing the dials ----------------------------------------
+function do_sync() {
+  if (!sel) return;
+  const now = new Date();
+  const r = solveTarget(sel.ra, sel.dec, now, S, S);
+  const said = prompt("You have " + sel.id + " centred.\n\nWhat does the RA scale "
+    + "actually read right now? (hours, e.g. 14.25 for 14 h 15 m)", r.r1.toFixed(3));
+  if (said === null) return;
+  const v = parseFloat(String(said).replace(",", "."));
+  if (!isFinite(v)) return;
+  dialSync(S.axis1, r.ha, v);
+  syncs.push([r.ha, v]);
+  if (syncs.length > 2) syncs = syncs.slice(-2);
+  save(); fill_setup(); draw_pick();
+  $("calnote").textContent = "Synced on " + sel.id + ": zero is now "
+    + S.axis1.zero.toFixed(3) + " h.";
+}
+function two_star() {
+  if (syncs.length < 2) {
+    $("calnote").textContent = "Sync on two objects well apart in hour angle first, "
+      + "then press this.";
+    return;
+  }
+  const resid = dialSync2(S.axis1, syncs[0], syncs[1]);
+  save(); fill_setup();
+  $("calnote").textContent = resid === null
+    ? "Those two syncs are at the same hour angle — they say nothing about direction."
+    : "Direction solved: " + (S.axis1.sign > 0 ? "+" : "−") + ", zero "
+      + S.axis1.zero.toFixed(3) + " h. Second star lands "
+      + Math.abs(resid).toFixed(2) + "° off — if that is large, one reading was "
+      + "misread.";
+}
+
+// ---------------- setup ----------------------------------------------------
+function fill_setup() {
+  $("lat").value = S.lat; $("lon").value = S.lon;
+  $("z1").value = S.axis1.zero; $("g1").value = String(S.axis1.sign);
+  $("z2").value = S.axis2.zero; $("g2").value = String(S.axis2.sign);
+  $("caljson").value = JSON.stringify({ axis1: S.axis1, axis2: S.axis2 });
+}
+function read_setup() {
+  S.lat = parseFloat($("lat").value) || 0; S.lon = parseFloat($("lon").value) || 0;
+  S.axis1.zero = parseFloat($("z1").value) || 0;
+  S.axis1.sign = parseFloat($("g1").value);
+  S.axis2.zero = parseFloat($("z2").value) || 0;
+  S.axis2.sign = parseFloat($("g2").value);
+  save(); draw_list(); draw_pick(); draw_align();
+}
+
+// ---------------- wiring ---------------------------------------------------
+document.querySelectorAll("nav button").forEach((b) => {
+  b.onclick = () => {
+    document.querySelectorAll("nav button").forEach(x => x.classList.remove("on"));
+    document.querySelectorAll("section").forEach(x => x.classList.remove("on"));
+    b.classList.add("on"); $("s-" + b.dataset.s).classList.add("on");
+    if (b.dataset.s === "align") draw_align();
+  };
+});
+$("q").oninput = draw_list;
+$("kind").onchange = draw_list;
+["lat", "lon", "z1", "z2"].forEach(id => { $(id).onchange = read_setup; });
+["g1", "g2"].forEach(id => { $(id).onchange = read_setup; });
+$("syncbtn").onclick = do_sync;
+$("twostar").onclick = two_star;
+$("geo").onclick = () => navigator.geolocation.getCurrentPosition((p) => {
+  S.lat = +p.coords.latitude.toFixed(4); S.lon = +p.coords.longitude.toFixed(4);
+  save(); fill_setup(); read_setup();
+}, () => { $("calnote").textContent = "The phone would not give its position."; });
+$("calcopy").onclick = () => { $("caljson").select();
+  try { document.execCommand("copy"); } catch (e) {} };
+$("calload").onclick = () => {
+  try {
+    const d = JSON.parse($("caljson").value);
+    if (d.axis1) S.axis1 = Object.assign(S.axis1, d.axis1);
+    if (d.axis2) S.axis2 = Object.assign(S.axis2, d.axis2);
+    save(); fill_setup(); read_setup();
+    $("calnote").textContent = "Loaded.";
+  } catch (e) { $("calnote").textContent = "That is not the calibration text."; }
+};
+function tick() {
+  const n = new Date();
+  $("clock").textContent = n.toTimeString().slice(0, 8) + "  ·  "
+    + (lstDeg(n, S.lon) / 15).toFixed(2) + " h sidereal  ·  "
+    + S.lat.toFixed(3) + ", " + S.lon.toFixed(3);
+  if (document.querySelector("#s-point").classList.contains("on")) draw_pick();
+  if (document.querySelector("#s-align").classList.contains("on")) draw_align();
+}
+fill_setup(); draw_list(); tick(); setInterval(tick, 1000);
+setInterval(draw_list, 60000);
+
+</script>

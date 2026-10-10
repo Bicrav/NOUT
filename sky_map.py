@@ -537,6 +537,12 @@ class SkyMap(QtWidgets.QWidget):
         ra_deg, dec_deg = self._body_now(name, ra_deg, dec_deg)
         self.center_ra = ra_deg % 360.0
         self.center_dec = dec_deg
+        # Bring it into view. Outside the framing view the map is aimed by azimuth and
+        # altitude, so setting the centre on its own left the target wherever it
+        # happened to be on screen — off the edge as often as not — and you had to go
+        # looking for the thing you had just searched for.
+        if self.mode != "framing":
+            self.aim_at_target()
         self.update()
 
     def set_focal(self, mm):

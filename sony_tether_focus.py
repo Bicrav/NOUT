@@ -608,6 +608,79 @@ def auto_stretch(img, strength=0.5, scnr=False, saturation=1.0):
     return res
 
 
+_HALF_COSITE = None          # (dx, dy) per channel, measured once from the stars
+
+
+def _measure_cosite(f, want=30):
+    """How far apart are the three channels, measured on the stars themselves.
+
+    A half-size decode makes one pixel from each 2x2 group of photosites, taking red
+    from one corner and blue from another while green averages the two left over, so
+    the channels land on grids a quarter of a pixel apart — red on one diagonal, blue
+    on the other. The sensor's colour pattern would say which way round, except that
+    cropping to the visible area can shift the Bayer phase, so the pattern is not to be
+    trusted: the stars are. Returns {channel: (dx, dy)} or None if unsure."""
+    g = f[..., 1]
+    bg = float(np.median(g))
+    sd = 1.4826 * float(np.median(np.abs(g[::4, ::4] - bg))) + 1e-6
+    peaks = cv2.dilate(g, np.ones((7, 7), np.uint8))
+    ys, xs = np.nonzero((g >= peaks) & (g > bg + 40.0 * sd))
+    keep = ((ys > 6) & (ys < g.shape[0] - 7) & (xs > 6) & (xs < g.shape[1] - 7))
+    ys, xs = ys[keep][:250], xs[keep][:250]
+    if len(ys) < want:
+        return None
+    gy, gx = np.mgrid[0:11, 0:11]
+    offs = {0: [], 2: []}
+    for y, x in zip(ys, xs):
+        win = f[y - 5:y + 6, x - 5:x + 6].astype(np.float64)
+        win = win - np.median(win, axis=(0, 1))
+        cen, ok = {}, True
+        for c in range(3):
+            wc = np.clip(win[..., c], 0, None)
+            t = wc.sum()
+            if t <= 0:
+                ok = False
+                break
+            cen[c] = ((wc * gx).sum() / t, (wc * gy).sum() / t)
+        if ok:
+            for c in (0, 2):
+                offs[c].append((cen[c][0] - cen[1][0], cen[c][1] - cen[1][1]))
+    out = {}
+    for c in (0, 2):
+        a = np.array(offs[c])
+        if len(a) < want:
+            return None
+        dx, dy = float(np.median(a[:, 0])), float(np.median(a[:, 1]))
+        if abs(dx) > 0.8 or abs(dy) > 0.8:     # not a quarter-pixel siting problem
+            return None
+        out[c] = (-dx, -dy)                    # what it takes to put it back
+    return out
+
+
+def _cosite_half_size(f):
+    """Put the three channels of a half-size decode back on one grid.
+
+    Measured on this camera: red sits +0.33, +0.30 px from green and blue -0.39, -0.26,
+    nearly three quarters of a pixel apart. At half size a star is about a pixel and a
+    half wide, so that is half a star: once the frames are registered and stretched,
+    every star grows a red dash on the same side — which is exactly what showed up in
+    the live stack and in no single exposure."""
+    global _HALF_COSITE
+    if _HALF_COSITE is None:
+        m = _measure_cosite(f)
+        if m is None:
+            return f                           # try again on a later frame
+        _HALF_COSITE = m
+    for ch, (dx, dy) in _HALF_COSITE.items():
+        if abs(dx) < 0.02 and abs(dy) < 0.02:
+            continue
+        M = np.float32([[1, 0, dx], [0, 1, dy]])
+        f[..., ch] = cv2.warpAffine(np.ascontiguousarray(f[..., ch]), M,
+                                    (f.shape[1], f.shape[0]), flags=cv2.INTER_LINEAR,
+                                    borderMode=cv2.BORDER_REPLICATE)
+    return f
+
+
 def _decode_linear(path, half=True):
     """Linear-light BGR float32 (0..255 scale) from a RAW — demosaic with NO gamma and
     NO auto-bright, exactly what a stacker like Siril integrates. Half-size by default
@@ -630,7 +703,8 @@ def _decode_linear(path, half=True):
             rgb = raw.postprocess(use_camera_wb=True, half_size=half,
                                   no_auto_bright=True, output_bps=16, gamma=(1, 1))
         f = cv2.cvtColor(rgb.astype(np.float32), cv2.COLOR_RGB2BGR)
-        return f / 65535.0 * 255.0
+        f = f / 65535.0 * 255.0
+        return _cosite_half_size(f) if half else f
     except Exception:               # noqa: BLE001
         return None
 
@@ -951,14 +1025,144 @@ def align_translation(ref_gray, cur_gray):
     return sx, sy
 
 
+def _radon_profiles(roi, step_deg=0.5):
+    """Sum the image along every direction. A diffraction spike pointing one way
+    collapses into a single tall, narrow peak when summed along that way, so the
+    angles where the sum is most peaked ARE the spikes."""
+    n = roi.shape[0]
+    c = (n / 2.0 - 0.5, n / 2.0 - 0.5)
+    angles = np.arange(0.0, 180.0, step_deg, dtype=np.float32)
+    prof = np.empty((len(angles), n), np.float32)
+    for i, a in enumerate(angles):
+        M = cv2.getRotationMatrix2D(c, float(a), 1.0)
+        rot = cv2.warpAffine(roi, M, (n, n), flags=cv2.INTER_LINEAR,
+                             borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+        prof[i] = rot.sum(axis=0)
+    return angles, prof
+
+
+def _peak_sub(v):
+    """Where the peak really is, to a fraction of a pixel (parabola on three points)."""
+    k = int(np.argmax(v))
+    if 0 < k < len(v) - 1:
+        a, b, c = float(v[k - 1]), float(v[k]), float(v[k + 1])
+        den = a - 2 * b + c
+        if abs(den) > 1e-9:
+            return k + 0.5 * (a - c) / den
+    return float(k)
+
+
+def bahtinov_error(gray, centre=None, size=256):
+    """How far a Bahtinov mask says you are from focus, in pixels.
+
+    The mask splits a bright star into three diffraction spikes: two crossing in an X
+    and one through the middle. In focus the middle spike passes exactly through the
+    crossing of the X; defocus slides it sideways, and which side says which way to
+    turn. The measurement is the signed distance from that crossing to the middle
+    spike.
+
+    Returns a dict with the error in pixels, the three spikes and the crossing point,
+    or None when three spikes cannot be made out — star too faint, mask off, or so far
+    out of focus that there is nothing to measure."""
+    g = np.asarray(gray, np.float32)
+    h, w = g.shape[:2]
+    if centre is None:
+        blur = cv2.GaussianBlur(g, (0, 0), 2.0)
+        _mn, _mx, _ml, loc = cv2.minMaxLoc(blur)
+        centre = (int(loc[0]), int(loc[1]))
+    size = int(min(size, h, w)) // 2 * 2
+    half = size // 2
+    x0 = int(np.clip(centre[0] - half, 0, max(w - size, 0)))
+    y0 = int(np.clip(centre[1] - half, 0, max(h - size, 0)))
+    roi = np.ascontiguousarray(g[y0:y0 + size, x0:x0 + size])
+    if roi.shape[0] != size or roi.shape[1] != size:
+        return None
+    roi = roi - float(np.median(roi))
+    peak = float(roi.max())
+    if peak <= 0:
+        return None
+    roi = np.clip(roi, 0, None)
+    # Blank the core: it is far brighter than the spikes and would dominate every
+    # direction equally, which tells us nothing about where the spikes point.
+    cc = size / 2.0 - 0.5
+    yy, xx = np.mgrid[0:size, 0:size]
+    roi[((xx - cc) ** 2 + (yy - cc) ** 2) < (0.05 * size) ** 2] = 0.0
+    # Taper the edges, so a spike leaving the frame does not end in a step
+    win = np.hanning(size).astype(np.float32)
+    roi *= win[:, None] * win[None, :]
+
+    angles, prof = _radon_profiles(roi)
+    base = cv2.GaussianBlur(prof, (0, 0), sigmaX=9.0, sigmaY=0.0)
+    sharp = (prof - base).max(axis=1)            # how peaked each direction is
+    sharp = cv2.GaussianBlur(sharp.reshape(-1, 1), (0, 0), sigmaX=0, sigmaY=1.2).ravel()
+    # three local maxima, at least 8 degrees apart, taken strongest first
+    order = np.argsort(sharp)[::-1]
+    picks = []
+    for i in order:
+        a = float(angles[i])
+        if all(min(abs(a - p), 180.0 - abs(a - p)) > 8.0 for p in picks):
+            picks.append(a)
+        if len(picks) == 3:
+            break
+    if len(picks) < 3:
+        return None
+    med = float(np.median(sharp))
+    mad = 1.4826 * float(np.median(np.abs(sharp - med))) + 1e-9
+    if (sharp[np.argmin(np.abs(angles - picks[2]))] - med) / mad < 4.0:
+        return None                               # the third "spike" is only noise
+
+    lines = []
+    for a in picks:
+        i = int(np.argmin(np.abs(angles - a)))
+        v = prof[i] - base[i]
+        p = _peak_sub(v) - (size / 2.0 - 0.5)
+        # summing along direction `a` measures position across it
+        th = np.radians(a + 90.0)
+        # A line has no direction of its own, so (theta, p) and (theta+pi, -p) describe
+        # the same line and would give the error opposite signs. Keep every normal in
+        # the same half plane, or the reading flips about as the mask is rotated.
+        if th >= np.pi:
+            th -= np.pi
+            p = -p
+        lines.append((th, float(p)))
+    # the middle spike is the one whose direction lies between the other two
+    ths = np.array([t for t, _ in lines])
+    ref = ths[0]
+    rel = np.array([((t - ref + np.pi / 2) % np.pi) - np.pi / 2 for t in ths])
+    order3 = np.argsort(rel)
+    a, mid, b = (lines[order3[0]], lines[order3[1]], lines[order3[2]])
+    ct1, st1, p1 = np.cos(a[0]), np.sin(a[0]), a[1]
+    ct2, st2, p2 = np.cos(b[0]), np.sin(b[0]), b[1]
+    det = ct1 * st2 - st1 * ct2
+    if abs(det) < 1e-6:
+        return None
+    X = ((p1 * st2 - p2 * st1) / det, (p2 * ct1 - p1 * ct2) / det)
+    err = float(X[0] * np.cos(mid[0]) + X[1] * np.sin(mid[0]) - mid[1])
+    sep = abs(float(((a[0] - b[0]) + np.pi / 2) % np.pi - np.pi / 2))
+    return {"error_px": err,
+            "cross": (X[0] + size / 2.0 - 0.5 + x0, X[1] + size / 2.0 - 0.5 + y0),
+            "angles": [float(np.degrees(t) % 180.0) for t, _ in (a, mid, b)],
+            "sep_deg": float(np.degrees(sep)), "roi": (x0, y0, size),
+            "lines": [(float(t), float(p)) for t, p in (a, mid, b)]}
+
+CALIBRATION_TYPES = ("flats", "darks", "biases", "bias", "dark", "flat", "offset")
+
+
 def cosmetic_correct(x, k=6.0, inplace=False):
     """Remove hot pixels without darks. A hot photosite lights ONE colour channel of
     one pixel; a star, however small, lights all three. So a pixel is fixed only when
-    a single channel spikes far above all its neighbours while the other two stay at
-    their local level — stars, even one pixel wide, are left alone."""
+    a single channel stands far above its local median while the other two stay at
+    their local level — stars, even one pixel wide, are left alone.
+
+    Measured against the maximum of the eight neighbours instead, which is what this
+    did at first, two warm photosites side by side shielded each other and got through:
+    on a real session that left some 240 of them per stack, drawn out into little red
+    dashes by the registration, on top of stars that were harder to detect through the
+    mess. Against the local median it is 3, with MORE stars found, not fewer. Anything
+    spread over more than a pixel — a nebula, however red — has a local median that
+    looks like itself, so it is never touched."""
     if x.ndim != 3 or x.shape[2] != 3:
         return x
-    ring = np.ones((3, 3), np.uint8); ring[1, 1] = 0
     sub = x[::4, ::4]
     out = x if inplace else x.copy()
     h = x.shape[0]
@@ -978,12 +1182,10 @@ def cosmetic_correct(x, k=6.0, inplace=False):
         for c in range(3):
             ch = np.ascontiguousarray(x[a:b, :, c])
             m = cv2.medianBlur(ch, 3)
-            nmax = cv2.dilate(ch, ring)
-            np.subtract(ch, nmax, out=nmax)          # reuse rather than allocate
-            spike.append(nmax > k * sig[c])
             med.append(m)
-            np.subtract(ch, m, out=nmax)
-            elev.append(nmax > 3.0 * sig[c])
+            np.subtract(ch, m, out=ch)               # reuse rather than allocate
+            spike.append(ch > k * sig[c])
+            elev.append(ch > 3.0 * sig[c])
         for c in range(3):
             o1, o2 = [i for i in range(3) if i != c]
             hot = spike[c][lo:hi] & ~elev[o1][lo:hi] & ~elev[o2][lo:hi]
@@ -3832,10 +4034,9 @@ class CameraWorker(QtCore.QThread):
                     self._seq_start = time.monotonic()
                     seq_type = os.path.basename(self._save_dir) or "lights"
                     self._seq_type = seq_type
-                    # flats / darks / bias go straight to disk: no preview, no stars,
+                    # flats / darks / biases go straight to disk: no preview, no stars,
                     # no stacking — that work only makes sense on light frames.
-                    self._calibration = seq_type.lower() in ("flats", "darks", "bias",
-                                                             "dark", "flat", "offset")
+                    self._calibration = seq_type.lower() in CALIBRATION_TYPES
                     if self._calibration:
                         self.status.emit(
                             "📁 {}: frames are saved only — no preview, no stacking, so "
@@ -6815,6 +7016,149 @@ class GeoBortleWorker(QtCore.QThread):
             self.done.emit(None, None, str(e))
 
 
+class BahtinovDialog(QtWidgets.QDialog):
+    """Focus with a Bahtinov mask, read off the live view.
+
+    The mask turns a bright star into three diffraction spikes. The two outer ones
+    cross in an X; the middle one slides across that crossing as you turn the focuser
+    and sits exactly on it at best focus. Eye alone, 'on it' means within a pixel or
+    two; measured, it means a number you can drive to zero."""
+
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.setWindowTitle("Focus — Bahtinov mask")
+        self.setMinimumWidth(560)
+        self._hist = []
+        self._best = None
+        v = QtWidgets.QVBoxLayout(self)
+        v.addWidget(_hint(
+            "Fit the mask over the objective and point at a bright star — a second or "
+            "third magnitude one is plenty; too bright and the spikes burn out. Keep "
+            "the live view running and the star roughly centred.<br><br>"
+            "Turn the focuser slowly and watch the number. It is the distance between "
+            "the middle spike and the crossing of the other two, so best focus is "
+            "zero. Which way to turn is not something the mask can tell you: move a "
+            "little, see whether the number grows or shrinks, and carry on the way "
+            "that shrinks it.<br><br>"
+            "Then take the mask off before shooting."))
+        top = QtWidgets.QHBoxLayout()
+        self.pic = QtWidgets.QLabel()
+        self.pic.setFixedSize(260, 260)
+        self.pic.setStyleSheet("background:#0d0d0d; border:1px solid #2a2f3a;")
+        self.pic.setAlignment(Qt.AlignCenter)
+        self.pic.setText("waiting for the live view…")
+        top.addWidget(self.pic)
+        right = QtWidgets.QVBoxLayout()
+        self.big = QtWidgets.QLabel("—")
+        self.big.setStyleSheet("font-size:40px; font-weight:700;")
+        self.big.setAlignment(Qt.AlignCenter)
+        right.addWidget(self.big)
+        self.verdict = QtWidgets.QLabel("Point at a star with the mask on.")
+        self.verdict.setAlignment(Qt.AlignCenter); self.verdict.setWordWrap(True)
+        right.addWidget(self.verdict)
+        trow = QtWidgets.QHBoxLayout()
+        trow.addWidget(QtWidgets.QLabel("In focus under"))
+        self.tol = QtWidgets.QDoubleSpinBox(); self.tol.setRange(0.2, 5.0)
+        self.tol.setSingleStep(0.1); self.tol.setValue(1.0); self.tol.setSuffix(" px")
+        self.tol.setToolTip("How close to the crossing counts as focused. One pixel of "
+                            "live view is a good target; tighten it on a long focal "
+                            "length.")
+        trow.addWidget(self.tol); trow.addStretch(1)
+        right.addLayout(trow)
+        self.detail = QtWidgets.QLabel(""); self.detail.setObjectName("cap")
+        self.detail.setWordWrap(True)
+        right.addWidget(self.detail)
+        right.addStretch(1)
+        top.addLayout(right, 1)
+        v.addLayout(top)
+        self.plot = pg.PlotWidget(); self.plot.setBackground("#0d0d0d")
+        self.plot.setLabel("left", "offset (px)"); self.plot.setLabel("bottom", "frames")
+        self.plot.showGrid(x=True, y=True, alpha=0.3)
+        self.plot.addLine(y=0, pen=pg.mkPen("#4ade80"))
+        self.plot.setMaximumHeight(150)
+        self.curve = self.plot.plot(pen=pg.mkPen("#ff7a29", width=2))
+        v.addWidget(self.plot)
+        foot = QtWidgets.QHBoxLayout()
+        clr = QtWidgets.QPushButton("Clear the trace"); clr.clicked.connect(self._clear)
+        close = QtWidgets.QPushButton("Close"); close.clicked.connect(self.close)
+        foot.addWidget(clr); foot.addStretch(1); foot.addWidget(close)
+        v.addLayout(foot)
+
+    def _clear(self):
+        self._hist = []; self._best = None
+        self.curve.setData([])
+
+    def feed(self, frame):
+        """One live-view frame."""
+        if frame is None or not self.isVisible():
+            return
+        try:
+            g = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame
+            r = bahtinov_error(g)
+            if r is None:
+                self.verdict.setText("No three spikes found. Brighter star, mask on, "
+                                     "and not wildly out of focus.")
+                return
+            err = r["error_px"]
+            self._hist.append(err)
+            if len(self._hist) > 300:
+                self._hist = self._hist[-300:]
+            self.curve.setData(self._hist)
+            tol = self.tol.value()
+            col = "#4ade80" if abs(err) <= tol else ("#fbbf24" if abs(err) <= 3 * tol
+                                                     else "#f87171")
+            self.big.setStyleSheet("font-size:40px; font-weight:700; color:{};".format(col))
+            self.big.setText("{:+.2f} px".format(err))
+            if abs(err) <= tol:
+                self.verdict.setText("In focus. Take the mask off.")
+            else:
+                trend = ""
+                if len(self._hist) >= 4:
+                    # Against the two readings just before, on the DISTANCE from focus.
+                    # Signed values cancel as you cross focus, and a long window keeps
+                    # saying "improving" compared with where you started while you are
+                    # already turning back out the other side.
+                    before = float(np.mean(np.abs(self._hist[-4:-2])))
+                    now = float(np.mean(np.abs(self._hist[-2:])))
+                    if abs(now) < abs(before) - 0.15:
+                        trend = " — keep going, it is improving"
+                    elif abs(now) > abs(before) + 0.15:
+                        trend = " — going the wrong way, turn back"
+                self.verdict.setText("Off focus by {:.2f} px{}".format(abs(err), trend))
+            if self._best is None or abs(err) < abs(self._best):
+                self._best = err
+            self.detail.setText("spikes {:.0f}° apart, at {}  ·  best so far {:+.2f} px"
+                                .format(r["sep_deg"],
+                                        ", ".join("{:.0f}°".format(a) for a in r["angles"]),
+                                        self._best))
+            self._draw(g, r)
+        except Exception:               # noqa: BLE001 - a bad frame must not stop focusing
+            pass
+
+    def _draw(self, g, r):
+        x0, y0, size = r["roi"]
+        roi = g[y0:y0 + size, x0:x0 + size].astype(np.float32)
+        roi -= float(np.median(roi))
+        peak = float(roi.max()) or 1.0
+        img = (np.clip(roi / peak, 0, 1) ** 0.4 * 255).astype(np.uint8)
+        img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+        c = size / 2.0 - 0.5
+        for i, (th, p) in enumerate(r["lines"]):
+            # the middle spike in orange, the X in blue
+            col = (41, 122, 255) if i == 1 else (255, 170, 80)
+            dx, dy = -np.sin(th), np.cos(th)
+            px, py = p * np.cos(th) + c, p * np.sin(th) + c
+            p1 = (int(px - 400 * dx), int(py - 400 * dy))
+            p2 = (int(px + 400 * dx), int(py + 400 * dy))
+            cv2.line(img, p1, p2, col, 1, cv2.LINE_AA)
+        cx, cy = r["cross"][0] - x0, r["cross"][1] - y0
+        cv2.circle(img, (int(cx), int(cy)), 6, (80, 230, 120), 1, cv2.LINE_AA)
+        img = cv2.resize(img, (260, 260), interpolation=cv2.INTER_NEAREST)
+        rgb = np.ascontiguousarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+        qi = QtGui.QImage(rgb.data, 260, 260, 3 * 260, QtGui.QImage.Format_RGB888)
+        self.pic.setPixmap(QtGui.QPixmap.fromImage(qi.copy()))
+
+
 class MountErrorDialog(QtWidgets.QDialog):
     """Measure what the mount really does, then say how long an exposure can be.
 
@@ -7683,7 +8027,7 @@ class GraXpertWorker(QtCore.QThread):
 
 
 class LibraryDialog(QtWidgets.QDialog):
-    """Manage the persistent calibration library: list master flats and darks/bias, and
+    """Manage the persistent calibration library: list master flats and darks/biases, and
     delete the ones you no longer want."""
     def __init__(self, parent, flats_dir):
         super().__init__(parent)
@@ -7697,7 +8041,7 @@ class LibraryDialog(QtWidgets.QDialog):
         del_flat = QtWidgets.QPushButton("🗑 Delete selected flat")
         del_flat.clicked.connect(self._del_flat); fr.addWidget(del_flat); fr.addStretch(1)
         v.addLayout(fr)
-        v.addWidget(QtWidgets.QLabel("<b>Master darks / bias</b> (ISO · exposure)"))
+        v.addWidget(QtWidgets.QLabel("<b>Master darks / biases</b> (ISO · exposure)"))
         self.darks_list = QtWidgets.QListWidget(); v.addWidget(self.darks_list, 1)
         dr = QtWidgets.QHBoxLayout()
         del_dark = QtWidgets.QPushButton("🗑 Delete selected dark")
@@ -8378,10 +8722,13 @@ class MainWindow(QtWidgets.QMainWindow):
         self.tabs.addTab(_results, "Results")
         self.tabs.addTab(_targets, "Targets")
         self.tabs.addTab(_skymap, "Sky Map")
+        self.tabs.addTab(self._build_observation_tab(), "Observation")
         self.tabs.addTab(_gallery, "Gallery")
         self._shoot_index, self._mosaic_index, self._results_index, \
-            self._targets_index, self._skymap_index, self._gallery_index = 0, 1, 2, 3, 4, 5
-        self._tab_icon_names = ["camera", "grid", "image", "target", "map", "gallery"]
+            self._targets_index, self._skymap_index, self._obs_index, \
+            self._gallery_index = 0, 1, 2, 3, 4, 5, 6
+        self._tab_icon_names = ["camera", "grid", "image", "target", "map", "target",
+                                "gallery"]
         night0 = getattr(self, "_night", False)
         if hasattr(self, "night_btn"):
             self.night_btn.blockSignals(True)
@@ -8603,6 +8950,12 @@ class MainWindow(QtWidgets.QMainWindow):
             lambda: self.worker.post("set_metric", name=self.metric_cb.currentText()))
         self.metric_cb.activated.connect(lambda *_: self._sync_hdmi())
         dl.addWidget(self.metric_cb)
+        self.baht_btn = QtWidgets.QPushButton("✳ Focus with a Bahtinov mask…")
+        self.baht_btn.setToolTip("Reads the three diffraction spikes of the mask on a "
+                                 "bright star and tells you how far the middle one is "
+                                 "from the crossing of the other two. Zero is focus.")
+        self.baht_btn.clicked.connect(self._open_bahtinov)
+        dl.addWidget(self.baht_btn)
         self.roi_slider = QtWidgets.QSlider(Qt.Horizontal)
         self.roi_slider.setRange(10, 100); self.roi_slider.setValue(int(self.roi_frac * 100))
         self.roi_slider.valueChanged.connect(self._on_roi)
@@ -8631,7 +8984,8 @@ class MainWindow(QtWidgets.QMainWindow):
         cl.addLayout(dirrow)
         typerow = QtWidgets.QHBoxLayout()
         self.type_combo = QtWidgets.QComboBox()
-        self.type_combo.addItems(["lights", "flats", "darks", "bias"]); self.type_combo.setEditable(True)
+        self.type_combo.addItems(["lights", "flats", "darks", "biases"])
+        self.type_combo.setEditable(True)
         self.type_combo.setToolTip("Photos go into <Folder>/<type> to sort directly.")
         typerow.addWidget(QtWidgets.QLabel("Type")); typerow.addWidget(self.type_combo)
         cl.addLayout(typerow)
@@ -8777,7 +9131,7 @@ class MainWindow(QtWidgets.QMainWindow):
         rl.addWidget(self.chk_cull)
         self.chk_stack = QtWidgets.QCheckBox("Live stacking")
         self.chk_stack.setToolTip("Aligns and stacks exposures to SEE the target emerge. "
-                                  "Preview only (no darks, no bias, no flats).")
+                                  "Preview only (no darks, no biases, no flats).")
         self.chk_stack.toggled.connect(lambda on: self.worker.post("set_stack", on=on))
         rl.addWidget(self.chk_stack)
         self.chk_degrad = QtWidgets.QCheckBox("Remove gradient")
@@ -8792,7 +9146,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.chk_flats.setChecked(QtCore.QSettings("NOUT", "NOUT").value("apply_flats", False, type=bool))
         self.chk_flats.toggled.connect(self._push_flats)
         rl.addWidget(self.chk_flats)
-        self.chk_darks = QtWidgets.QCheckBox("Apply darks/bias")
+        self.chk_darks = QtWidgets.QCheckBox("Apply darks/biases")
         self.chk_darks.setToolTip("Subtract a master dark/bias matched to ISO + exposure.")
         self.chk_darks.setChecked(QtCore.QSettings("NOUT", "NOUT").value("apply_darks", False, type=bool))
         self.chk_darks.toggled.connect(self._push_darks)
@@ -8889,7 +9243,7 @@ class MainWindow(QtWidgets.QMainWindow):
         asrow.addWidget(QtWidgets.QLabel("thresholds")); asrow.addWidget(self.batt_thr); asrow.addWidget(self.disk_thr)
         rl.addLayout(asrow)
         self.solve_btn = QtWidgets.QPushButton("🔭 Identify field (last photo)")
-        self.solve_btn.clicked.connect(self._run_solve)
+        self.solve_btn.clicked.connect(lambda: self._run_solve(show=True))
         rl.addWidget(self.solve_btn)
         srow2 = QtWidgets.QHBoxLayout()
         self.solve_focal = QtWidgets.QDoubleSpinBox()
@@ -9125,7 +9479,7 @@ class MainWindow(QtWidgets.QMainWindow):
                      (self.chk_track, "Tracking alert"),
                      (self.chk_kappa, "κ-σ rejection"),
                      (self.chk_dither, "Dither"),
-                     (self.chk_darks, "Darks / bias"),
+                     (self.chk_darks, "Darks / biases"),
                      (self.chk_flats, "Flats")):
             w.setText(t)
         kbox = QtWidgets.QWidget(); kbox.setObjectName("plain")
@@ -9497,7 +9851,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.build_dark_btn.clicked.connect(self._build_master_dark)
         bar2.addWidget(self.build_dark_btn)
         self.lib_btn = QtWidgets.QPushButton("📚 Manage library…")
-        self.lib_btn.setToolTip("List and delete your saved master flats and darks/bias.")
+        self.lib_btn.setToolTip("List and delete your saved master flats and darks/biases.")
         self.lib_btn.clicked.connect(lambda: LibraryDialog(self, self._flats_dir()).exec())
         bar2.addWidget(self.lib_btn)
         bar2.addStretch(1)
@@ -11821,6 +12175,9 @@ class MainWindow(QtWidgets.QMainWindow):
         me = getattr(self, "_mount_err_dlg", None)
         if me is not None and me.recording:
             me.feed(frame)
+        bd = getattr(self, "_baht_dlg", None)
+        if bd is not None and bd.isVisible():
+            bd.feed(frame)
         h, w = frame.shape[:2]
         disp = frame.copy()
         # ROI only if sharpness measurement is active
@@ -11917,6 +12274,37 @@ class MainWindow(QtWidgets.QMainWindow):
             self.prog_label.setText("Shot #{}  ·  {} elapsed  ·  manual stop".format(
                 done, _fmt_dur(elapsed)))
 
+    def _reset_view(self, clear_picture):
+        """Clear what belonged to the series that has just ended.
+
+        The numbers under the picture — sharpness, roundness, star count, clipping,
+        the histogram — all describe the LAST frame, so leaving them up after a series
+        has stopped means reading the previous target's figures while setting up the
+        next one. The picture itself is only cleared when there is no stack to look at:
+        after a run of lights the stack is the result, and wiping it off the screen
+        would be taking away the thing you just spent an hour collecting."""
+        for name in ("star_label", "clip_label", "track_info", "track_match"):
+            lbl = getattr(self, name, None)
+            if lbl is not None:
+                try:
+                    lbl.setText("")
+                except RuntimeError:
+                    pass
+        for c in (getattr(self, "hist_curve_r", None), getattr(self, "hist_curve_g", None),
+                  getattr(self, "hist_curve_b", None)):
+            if c is not None:
+                c.setData([0])
+        self._sb.pop("hfr", None)
+        self._refresh_statusbar()
+        if clear_picture:
+            self._last_capture_bgr = None
+            self._stack_float = None
+            try:
+                self.view.setText("")
+                self.readout.setText("")
+            except RuntimeError:
+                pass
+
     @Slot(bool)
     def on_interval_state(self, running):
         self._iv_running = running
@@ -11942,6 +12330,12 @@ class MainWindow(QtWidgets.QMainWindow):
             self._set_review_mode(True)
         else:
             self._single_shot = False
+            # A calibration run leaves nothing to look at, and a run without live
+            # stacking leaves only the last frame; either way the readings on screen
+            # are stale the moment the series ends.
+            kind = self.type_combo.currentText().strip().lower()
+            self._reset_view(clear_picture=(kind in CALIBRATION_TYPES
+                                            or self._stack_float is None))
             # sequence finished: we STAY on the final preview until "Done" clicked
             self._await_done = True
             self.rec_label.setVisible(False)
@@ -12066,8 +12460,16 @@ class MainWindow(QtWidgets.QMainWindow):
         self.readout.setText(caption)
         self._last_capture_bgr = img
         if img is None:
-            self.view.setText("Photo saved — RAW preview unavailable.\n"
-                              "To view .ARW : pip install rawpy")
+            kind = self.type_combo.currentText().strip().lower()
+            if kind in CALIBRATION_TYPES:
+                # not a failure: calibration frames are deliberately never decoded,
+                # which is most of what makes such a series quick
+                self.view.setText("{} · {} saved.\nCalibration frames are not decoded "
+                                  "or displayed — that is what keeps the series fast."
+                                  .format(kind.capitalize(), caption.split("·")[0].strip()))
+            else:
+                self.view.setText("Photo saved — RAW preview unavailable.\n"
+                                  "To view .ARW : pip install rawpy")
             for c in (self.hist_curve_r, self.hist_curve_g, self.hist_curve_b):
                 c.setData([0])
             return
@@ -12328,7 +12730,11 @@ class MainWindow(QtWidgets.QMainWindow):
     def _solve_online(self):
         return self.solve_mode.currentText() == "Online"
 
-    def _run_solve(self):
+    def _run_solve(self, show=False):
+        """`show` only when you asked for it. A solve that NOUT starts by itself after
+        a frame used to jump to Results and open the picture in a window, which takes
+        the app away from whatever you were doing in the middle of a series."""
+        self._solve_show = bool(show)
         path = self._last_capture_path
         if not path or not os.path.exists(path):
             self.solve_label.setText("Take a capture first, then launch identification.")
@@ -12383,10 +12789,11 @@ class MainWindow(QtWidgets.QMainWindow):
             if it is not None and "🔭" not in it.text():
                 it.setText(it.text() + "  🔭")
             self._save_annotated(annot, "annot")
-            self.tabs.setCurrentIndex(2)
-            self._open_image_dialog(e[0], e[1], annot=annot,
-                                    processed=e[3] if len(e) > 3 else False,
-                                    raw=e[4] if len(e) > 4 else None)
+            if getattr(self, "_solve_show", False):
+                self.tabs.setCurrentIndex(2)
+                self._open_image_dialog(e[0], e[1], annot=annot,
+                                        processed=e[3] if len(e) > 3 else False,
+                                        raw=e[4] if len(e) > 4 else None)
         else:
             self._add_solved_result(getattr(self, "_last_capture_bgr", None), annot,
                                     ra, dec, "🔭 Identify (last photo)")
@@ -12433,8 +12840,9 @@ class MainWindow(QtWidgets.QMainWindow):
         if annot is not None:
             item.setText(item.text() + "  🔭")
             self._save_annotated(annot, "annot")
-        self.tabs.setCurrentIndex(2)
-        self._open_image_dialog(base, label, annot=annot)
+        if getattr(self, "_solve_show", False):
+            self.tabs.setCurrentIndex(2)
+            self._open_image_dialog(base, label, annot=annot)
 
     def _save_annotated(self, annot, name):
         if annot is None:
@@ -14708,6 +15116,14 @@ class MainWindow(QtWidgets.QMainWindow):
         v.addStretch(1)
         return page
 
+    def _open_bahtinov(self):
+        dlg = getattr(self, "_baht_dlg", None)
+        if dlg is None:
+            dlg = self._baht_dlg = BahtinovDialog(self)
+        dlg.show(); dlg.raise_(); dlg.activateWindow()
+        if not self.chk_live.isChecked():
+            self._say("Turn the live view on — the mask is read from it.", key="baht")
+
     def _open_mount_error(self):
         dlg = getattr(self, "_mount_err_dlg", None)
         if dlg is None:
@@ -15043,6 +15459,252 @@ class MainWindow(QtWidgets.QMainWindow):
                 f, fov_str(f), cols, rows, cols * rows,
                 step_w, pct_w, step_h, pct_h))
 
+    # ---------------- Observation (at the eyepiece) -----------------------
+    def _build_observation_tab(self):
+        """Visual observing: no camera, no live view — a map, a search, and a GoTo.
+
+        The working method this is built around: put a star you know in the middle of
+        the eyepiece, tell NOUT which one, then pick the next object and let the motor
+        carry the right ascension across. The mount has no declination motor, so that
+        part comes back as an angle to set by hand on the dial — which is the honest
+        answer rather than a GoTo that quietly only does half the journey."""
+        page = QtWidgets.QWidget()
+        lay = QtWidgets.QHBoxLayout(page)
+
+        import sky_map
+        self.obs_map = sky_map.SkyMap()
+        self.obs_map.setMinimumWidth(420)
+        lay.addWidget(self.obs_map, 1)
+
+        side = QtWidgets.QVBoxLayout()
+        side.setSpacing(8)
+        side.addWidget(_hint(
+            "Centre a star you can name in the eyepiece, type its name below, pick it "
+            "and press <b>Sync here</b>: from then on the mount knows where it is "
+            "pointing.<br><br>"
+            "Then search for what you want to see and press <b>GoTo</b>. The motor "
+            "takes the right ascension across. Your mount has no motor on the other "
+            "axis, so the declination comes back as an angle to set by hand on the "
+            "graduated circle — the figure is given below, and it is the same circle "
+            "you use for polar alignment.<br><br>"
+            "The list puts what is high in the sky now at the top, and leaves out "
+            "whatever is behind your trees and roofs if you have drawn a horizon."))
+
+        srow = QtWidgets.QHBoxLayout()
+        self.obs_search = QtWidgets.QLineEdit()
+        self.obs_search.setPlaceholderText("Name or catalogue number — M13, Albireo, 7000…")
+        self.obs_search.textChanged.connect(self._obs_suggest)
+        self.obs_search.returnPressed.connect(self._obs_take_first)
+        srow.addWidget(self.obs_search, 1)
+        self.obs_filter = QtWidgets.QComboBox()
+        self.obs_filter.addItem("everything", None)
+        for lbl in ("Globular Cluster", "Open Cluster", "Galaxy", "Planetary Nebula",
+                    "Nebula", "Double Star"):
+            self.obs_filter.addItem(lbl.lower(), lbl)
+        self.obs_filter.currentIndexChanged.connect(lambda *_: self._obs_suggest())
+        srow.addWidget(self.obs_filter)
+        side.addLayout(srow)
+
+        self.obs_list = QtWidgets.QListWidget()
+        self.obs_list.setMinimumHeight(190)
+        self.obs_list.itemSelectionChanged.connect(self._obs_pick)
+        self.obs_list.itemDoubleClicked.connect(lambda *_: self._obs_goto())
+        side.addWidget(self.obs_list)
+
+        self.obs_title = QtWidgets.QLabel("Nothing selected.")
+        self.obs_title.setStyleSheet("font-size:15px; font-weight:600;")
+        self.obs_title.setWordWrap(True)
+        side.addWidget(self.obs_title)
+        self.obs_where = QtWidgets.QLabel("")
+        self.obs_where.setObjectName("cap"); self.obs_where.setWordWrap(True)
+        side.addWidget(self.obs_where)
+
+        dials = QtWidgets.QHBoxLayout()
+        self.obs_a1 = QtWidgets.QLabel("—")
+        self.obs_a2 = QtWidgets.QLabel("—")
+        for lbl, cap in ((self.obs_a1, "RA dial — the motor drives this"),
+                         (self.obs_a2, "Dec dial — set this by hand")):
+            box = QtWidgets.QVBoxLayout()
+            lbl.setStyleSheet("font-size:19px; font-weight:700; color:#f59e0b;")
+            lbl.setAlignment(Qt.AlignCenter)
+            c = QtWidgets.QLabel(cap); c.setObjectName("cap")
+            c.setAlignment(Qt.AlignCenter); c.setWordWrap(True)
+            box.addWidget(lbl); box.addWidget(c)
+            dials.addLayout(box)
+        side.addLayout(dials)
+
+        brow = QtWidgets.QHBoxLayout()
+        self.obs_sync_btn = QtWidgets.QPushButton("📍 Sync here")
+        self.obs_sync_btn.setToolTip("Tells the mount that the object selected above is "
+                                     "what is in the middle of the eyepiece right now.")
+        self.obs_sync_btn.clicked.connect(self._obs_sync)
+        self.obs_goto_btn = QtWidgets.QPushButton("🎯 GoTo")
+        self.obs_goto_btn.setObjectName("primary")
+        self.obs_goto_btn.clicked.connect(self._obs_goto)
+        stop = QtWidgets.QPushButton("⛔ Stop")
+        stop.clicked.connect(self._mount_stop_now)
+        brow.addWidget(self.obs_sync_btn); brow.addWidget(self.obs_goto_btn)
+        brow.addWidget(stop)
+        side.addLayout(brow)
+        self.obs_msg = QtWidgets.QLabel("")
+        self.obs_msg.setWordWrap(True); self.obs_msg.setObjectName("cap")
+        side.addWidget(self.obs_msg)
+        side.addStretch(1)
+        lay.addLayout(side)
+        self._obs_target = None
+        self._obs_timer = QtCore.QTimer(self)
+        self._obs_timer.setInterval(5000)
+        self._obs_timer.timeout.connect(self._obs_refresh)
+        self._obs_timer.start()
+        return page
+
+    def _obs_altaz(self, ra, dec, when=None):
+        """Where an object is in the sky right now, as seen from the site."""
+        import manual_goto
+        from datetime import datetime as _dt
+        when = when or _dt.utcnow()   # noqa: DTZ003 - the rest of the app is naive UTC
+        lst = manual_goto.lst_deg(when, self.t_lon.value())
+        return manual_goto.radec_to_altaz(lst - ra, dec, self.t_lat.value())
+
+    def _obs_suggest(self):
+        """What to show for what has been typed: matches first, and among them the
+        ones that are actually up, highest first. An object below the horizon is of no
+        use at the eyepiece, however good a match it is."""
+        self._ensure_search_index()
+        q = self.obs_search.text().strip().lower()
+        nq = self._norm_id(q) if q else ""
+        want = self.obs_filter.currentData()
+        kinds = getattr(self, "_obs_kinds", None)
+        if kinds is None:
+            kinds = self._obs_kinds = {}
+            try:
+                import astro_targets
+                for t in astro_targets.load_catalog():
+                    kinds[t.id] = (t.type or "", t.mag, t.size_arcmin)
+            except Exception:           # noqa: BLE001
+                pass
+        rows = []
+        for oid, name, ra, dec in self._search_index:
+            if want:
+                kind = kinds.get(oid, ("", None, None))[0]
+                if want.lower() not in (kind or "").lower():
+                    continue
+            if q:
+                if not (q in (name or "").lower() or q in oid.lower()
+                        or (nq and self._norm_id(oid) == nq)):
+                    continue
+            alt, az = self._obs_altaz(ra, dec)
+            if alt < 0:
+                continue
+            if not self._above_local_horizon(alt, az):
+                continue
+            rows.append((alt, oid, name, ra, dec, az))
+        rows.sort(key=lambda r: -r[0])
+        self.obs_list.blockSignals(True)
+        self.obs_list.clear()
+        for alt, oid, name, ra, dec, az in rows[:60]:
+            kind, mag, size = kinds.get(oid, ("", None, None))
+            bits = [oid]
+            if name and name != oid:
+                bits.append("— " + name)
+            tail = []
+            if mag is not None and mag == mag:
+                tail.append("mag {:.1f}".format(mag))
+            if size:
+                tail.append("{:.0f}′".format(size))
+            if kind:
+                tail.append(kind.lower())
+            txt = "{:<22} {:>3.0f}° high   {}".format(" ".join(bits), alt,
+                                                      " · ".join(tail))
+            it = QtWidgets.QListWidgetItem(txt)
+            it.setData(Qt.UserRole, (oid, name, ra, dec))
+            self.obs_list.addItem(it)
+        self.obs_list.blockSignals(False)
+        if not rows:
+            self.obs_msg.setText("Nothing matching is above your horizon just now."
+                                 if q else "")
+
+    def _above_local_horizon(self, alt, az):
+        prof = self._active_horizon() if hasattr(self, "hz_combo") else None
+        if not prof:
+            return True
+        try:
+            import astro_targets
+            return alt >= astro_targets.horizon_alt(prof, az)
+        except Exception:               # noqa: BLE001
+            return True
+
+    def _obs_take_first(self):
+        if self.obs_list.count():
+            self.obs_list.setCurrentRow(0)
+
+    def _obs_pick(self):
+        it = self.obs_list.currentItem()
+        if it is None:
+            return
+        self._obs_target = it.data(Qt.UserRole)
+        oid, name, ra, dec = self._obs_target
+        try:
+            self.obs_map.set_target(oid, ra, dec)
+        except Exception:               # noqa: BLE001
+            pass
+        self._obs_refresh()
+
+    def _obs_refresh(self):
+        import sky_map
+        """Keep the figures honest as the sky turns."""
+        if self._obs_target is None or not getattr(self, "obs_title", None):
+            return
+        oid, name, ra, dec = self._obs_target
+        alt, az = self._obs_altaz(ra, dec)
+        self.obs_title.setText(name if name and name != oid else oid)
+        self.obs_where.setText(
+            "{}  ·  {:.0f}° above the horizon, {} ({:.0f}°)  ·  RA {:.3f}° Dec {:+.3f}°"
+            .format(oid, alt, sky_map._az_name(az), az, ra, dec)
+            + ("" if alt > 0 else "   —  below the horizon"))
+        try:
+            eng = self._mg_engine()
+            res = eng.solve(oid, float(ra), float(dec), self._mg_when_utc())
+            p = res.primary
+            self.obs_a1.setText(p.axis1.text)
+            self.obs_a2.setText(p.axis2.text)
+        except Exception as e:          # noqa: BLE001
+            self.obs_a1.setText("—"); self.obs_a2.setText("—")
+            self.obs_msg.setText("Pointing maths unavailable: {}".format(e))
+
+    def _obs_kw(self):
+        if self._obs_target is None:
+            self.obs_msg.setText("Pick something in the list first.")
+            return None
+        oid, name, ra, dec = self._obs_target
+        return dict(ip=self._mip(), ra=float(ra), dec=float(dec), name=oid,
+                    lat=self.t_lat.value(), lon=self.t_lon.value(), plate=0.0, flip=False)
+
+    def _obs_sync(self):
+        kw = self._obs_kw()
+        if kw is None:
+            return
+        self._mg_last_a1_op = "sync"
+        self.obs_msg.setText("Syncing on {} — the mount now knows where it points. "
+                             "(The first sync of a session measures the axis "
+                             "directions, about 10 s.)".format(kw["name"]))
+        self.worker.post("mount_axis1_sync", **kw)
+
+    def _obs_goto(self):
+        kw = self._obs_kw()
+        if kw is None:
+            return
+        alt, _az = self._obs_altaz(kw["ra"], kw["dec"])
+        if alt < 0:
+            self.obs_msg.setText("{} is below the horizon — nothing to point at."
+                                 .format(kw["name"]))
+            return
+        kw.update(tol_deg=0.2, max_from_sync=60.0, max_iter=6, rate=256)
+        self._mg_last_a1_op = "goto"
+        self.obs_msg.setText("Slewing to {} — about 0.3°/s, so a long way takes a "
+                             "minute or two. Set the Dec dial to {} while it runs."
+                             .format(kw["name"], self.obs_a2.text()))
+        self.worker.post("mount_axis1_goto", **kw)
     # --- Polar Alignment (Drift) -----------------------------------------
     def _toggle_drift(self):
         self._drift_active = not getattr(self, "_drift_active", False)
@@ -15128,7 +15790,7 @@ class MainWindow(QtWidgets.QMainWindow):
         labels = {
             "darks": "Darks: lens covered, SAME exposure time & ISO as lights, ~20–30.",
             "flats": "Flats: uniform background (twilight sky / white screen), histogram at ~50%, ~20–30.",
-            "bias": "Bias: lens covered, SHORTEST possible exposure, same ISO, ~50.",
+            "biases": "Biases: lens covered, SHORTEST possible exposure, same ISO, ~50.",
         }
         self.type_combo.setCurrentText(kind)
         self._sections["cap"].set_expanded(True)      # the folder/type row is in Capture

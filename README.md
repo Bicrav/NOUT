@@ -27,6 +27,23 @@ sky model when it is installed.
 **Public view** — the picture full screen on a second display, with the target's name
 and distance, for visitors.
 
+**Observing at the eyepiece** — a tab with no camera in it: the sky map, a search
+over the Messier and named NGC objects and the bright stars, ranked by how high they
+are now and filtered by your own horizon, and a GoTo. The right ascension is driven by
+the motor; the declination, which this mount has no motor for, comes back as an angle
+to set by hand on the graduated circle rather than being quietly left out.
+
+**On your phone** — `docs/index.html` is the same pointing maths in one 34 kB page:
+both dial readings with the 24 h scale drawn, Polaris' place on the polar-scope
+reticle, and a calibration that works out your dials' zero and direction by syncing on
+one or two stars. It needs no network, no camera and no mount connection — a manual
+GoTo is pure arithmetic — so it runs offline on a phone while the computer stays at
+home. Its readings match the Python to 1e-13 degrees.
+
+**Focus** — a Bahtinov mask reader: the three diffraction spikes are found with a Radon
+transform and the middle one's distance from the crossing of the other two is the focus
+error, to a tenth of a pixel. Also live sharpness metrics and star-count focusing.
+
 **Mount** — Star Adventurer 2i over Wi-Fi: tracking rates (sidereal, lunar, solar,
 planetary), motorised slews in RA, dithering between exposures, and a manual GoTo that
 computes both angles for a rig whose axes are read from engraved dials. The rate is
