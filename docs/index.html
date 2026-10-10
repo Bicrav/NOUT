@@ -49,7 +49,7 @@
 </style>
 <h1>N O U T &nbsp;·&nbsp; POINTING</h1>
 <div class="sub" id="clock">—</div>
-<div class="sub" style="margin-top:-6px;opacity:.6">build 2026-10-10 20:16</div>
+<div class="sub" style="margin-top:-6px;opacity:.6">build 2026-10-10 20:22</div>
 
 <section id="s-point" class="on">
   <div class="row">
@@ -95,6 +95,39 @@
       <label for="flip">turned round (180°)</label></div>
     <div class="row"><input type="checkbox" id="mirror" style="width:auto">
       <label for="mirror">mirrored left to right</label></div>
+    <div class="row"><input type="checkbox" id="ccw" style="width:auto">
+      <label for="ccw">hours engraved the other way round</label></div>
+  </div>
+  <div class="card">
+    <div class="cap" style="text-align:left">Where the axis is</div>
+    <div class="hint">The reticle is bolted to the right-ascension axis, so it turns
+      with it. Read your reference mark against the fixed 24 h scale and type it
+      here — the drawing turns to match.</div>
+    <div class="row"><label style="width:150px">the <b id="markname">10 h 30</b>
+      mark reads</label>
+      <input id="scale24" type="number" step="0.25" style="width:88px">
+      <label>h</label></div>
+    <div class="hint" id="rotnote"></div>
+    <details style="margin-top:10px">
+      <summary class="cap" style="text-align:left">Set this up once</summary>
+      <div class="hint" style="margin-top:8px">The scale and the reticle are fixed to
+        each other, but by an offset no one can know from outside. Teach it once:
+        turn the axis until the drawing below matches the eyepiece, then type what
+        the fixed scale reads and press Learn. After that, typing the scale reading
+        is all you ever do.</div>
+      <div class="row"><label style="width:62px">turned</label>
+        <input id="roth" type="number" step="1" style="width:66px"><label>h</label>
+        <input id="rotm" type="number" step="1" style="width:66px"><label>m</label></div>
+      <div class="row"><button class="act" id="rotminus">− 1 h</button>
+        <button class="act" id="rotplus">+ 1 h</button></div>
+      <div class="row"><button class="act primary" id="learn">Learn: the scale
+        reads what is typed above</button></div>
+      <div class="row"><input type="checkbox" id="rotdir" style="width:auto">
+        <label for="rotdir">the drawing turns the wrong way</label></div>
+      <div class="row"><label style="width:120px">reference mark</label>
+        <input id="mark" type="number" step="0.5" style="width:80px"><label>on the
+        engraved clock</label></div>
+    </details>
   </div>
   <div class="card hint">
     Put Polaris on the small circle at the position shown, then lock the altitude and
@@ -261,7 +294,7 @@ function polarisState(when, lonEast) {
 const DEF = { lat: 48.8566, lon: 2.3522,
   axis1: { units: "hours", zero: 0, sign: -1, wrap: true },
   axis2: { units: "degrees", zero: 90, sign: -1, wrap: false },
-  flip: true, mirror: false };      // a straight polar scope turns the view round
+  flip: true, mirror: false, ccw: false, rot_h: 0, rot_m: 0, mark: 10.5 };      // a straight polar scope turns the view round
 let S = Object.assign({}, DEF);
 try { S = Object.assign(S, JSON.parse(localStorage.getItem("nout.point") || "{}")); }
 catch (e) { /* first run, or storage blocked */ }
@@ -365,13 +398,33 @@ function dial_svg(r1, r2) {
 }
 
 // ---------------- polar alignment ------------------------------------------
+function manualRot() {
+  const h = S.rot_h || 0;
+  return h + (S.rot_m || 0) / 60 * (h >= 0 ? 1 : -1);
+}
+function currentRot() {
+  // Once the offset between the fixed scale and the reticle has been learnt, the
+  // scale reading IS the answer; before that, the manual value stands in.
+  if (S.rot_off === undefined || S.scale24 === undefined || S.scale24 === null
+      || S.scale24 === "") return manualRot();
+  const dir = S.rot_dir ? -1 : 1;
+  return dir * (S.scale24 - S.rot_off);
+}
+
+// The reticle is bolted to the RA axis, so it turns with it and is almost never
+// upright. Same model as NOUT's reticle widget: the engraved scale turns by
+// `rot` hours of RA while Polaris stays where the sky actually puts it.
+function numAngle(n, rot) {
+  return (S.ccw ? n * 30 : -n * 30) + rot * 15;
+}
+function clockReading(ha, rot) {
+  const d = (ha - rot) / 2;
+  return (((S.ccw ? d : -d) % 12) + 12) % 12;
+}
 function draw_align() {
   const now = new Date(), p = polarisState(now, S.lon);
-  const R = 96, cx = 120, cy = 120;
-  // the same geometry as NOUT's reticle: anticlockwise from the top, which is how
-  // the sky turns around the pole when you face north, then the view your optics
-  // actually give you
-  const scale = R / 76.0;                       // the drawn field edge is 76'
+  const rot = currentRot();
+  const R = 96, cx = 120, cy = 120, scale = R / 76.0;   // 76' at the drawn edge
   function pt(rArcmin, skyDeg) {
     const t = skyDeg * Math.PI / 180;
     let x = -scale * rArcmin * Math.sin(t), y = -scale * rArcmin * Math.cos(t);
@@ -381,16 +434,22 @@ function draw_align() {
   }
   const o = ["<circle cx=120 cy=120 r=" + R + " fill='none' stroke='#2a1a12'/>",
              "<circle cx=120 cy=120 r='3' fill='#8a4a22'/>"];
-  for (let n = 0; n < 12; n++) {                // the engraved clock, 2 h a division
-    const [x1, y1] = pt(68, -n * 30), [x2, y2] = pt(76, -n * 30);
+  for (let n = 0; n < 12; n++) {
+    const ang = numAngle(n, rot);
+    const [x1, y1] = pt(68, ang), [x2, y2] = pt(76, ang), [tx, ty] = pt(56, ang);
     o.push("<line x1=" + x1.toFixed(1) + " y1=" + y1.toFixed(1)
       + " x2=" + x2.toFixed(1) + " y2=" + y2.toFixed(1)
       + " stroke='#5a3620' stroke-width='" + (n % 3 ? 1 : 1.8) + "'/>");
-    const [tx, ty] = pt(56, -n * 30);
     o.push("<text x=" + tx.toFixed(1) + " y=" + (ty + 4).toFixed(1)
       + " fill='#8a4a22' font-size='10' text-anchor='middle'>" + n + "</text>");
   }
-  [36, 40, 44].forEach(function (r) {           // the rings Polaris sits between
+  // your own reference mark, drawn so you can line the drawing up with the eyepiece
+  const mk = (S.mark === undefined ? 10.5 : S.mark);
+  const [mx1, my1] = pt(30, numAngle(mk, rot)), [mx2, my2] = pt(76, numAngle(mk, rot));
+  o.push("<line x1=" + mx1.toFixed(1) + " y1=" + my1.toFixed(1)
+    + " x2=" + mx2.toFixed(1) + " y2=" + my2.toFixed(1)
+    + " stroke='#4ade80' stroke-width='1.6' stroke-dasharray='4 3'/>");
+  [36, 40, 44].forEach(function (r) {
     o.push("<circle cx=120 cy=120 r=" + (r * scale).toFixed(1)
       + " fill='none' stroke='#3a2416' stroke-dasharray='2 5'/>");
   });
@@ -400,14 +459,19 @@ function draw_align() {
   o.push("<circle cx=" + sx.toFixed(1) + " cy=" + sy.toFixed(1)
     + " r='2.5' fill='#ffb673'/>");
   $("reticle").innerHTML = o.join("");
-  const h = Math.floor(p.clock), m = Math.round((p.clock - h) * 60);
+  const c = clockReading(p.ha, rot);
+  const h = Math.floor(c), m = Math.round((c - h) * 60);
   $("polclock").textContent = h + " h " + String(m).padStart(2, "0");
-  $("polsub").textContent = "on the engraved clock  \u00b7  "
-    + (p.pdist * 60).toFixed(1) + "' from the pole";
-  $("polnote").textContent = "Polaris is " + (p.pdist * 60).toFixed(1)
-    + " arcminutes from the true pole tonight, and that shrinks by about 0.3' a year "
-    + "\u2014 a reticle engraved years ago is already out. If the drawing puts "
-    + "Polaris opposite where you see it, turn the view round below.";
+  $("polsub").textContent = "on the engraved scale  \u00b7  "
+    + (p.pdist * 60).toFixed(1) + "' from the centre";
+  $("markname").textContent = (mk === 10.5 ? "10 h 30" : mk.toFixed(1));
+  $("rotnote").textContent = (S.rot_off === undefined)
+    ? "Not set up yet — the drawing is following the manual value below."
+    : "Reticle turned " + rot.toFixed(2) + " h of right ascension.";
+  $("polnote").textContent = "The green dashed line is your " + mk.toFixed(1).replace(".5", " h 30")
+    + " mark. Turn the axis until the drawing matches the eyepiece, then put Polaris "
+    + "on the circle shown. Polaris is " + (p.pdist * 60).toFixed(1)
+    + "' from the true pole tonight.";
 }
 
 // ---------------- syncing the dials ----------------------------------------
@@ -449,10 +513,23 @@ function fill_setup() {
   $("z1").value = S.axis1.zero; $("g1").value = String(S.axis1.sign);
   $("z2").value = S.axis2.zero; $("g2").value = String(S.axis2.sign);
   $("flip").checked = !!S.flip; $("mirror").checked = !!S.mirror;
+  $("ccw").checked = !!S.ccw;
+  $("roth").value = S.rot_h || 0; $("rotm").value = S.rot_m || 0;
+  $("mark").value = (S.mark === undefined ? 10.5 : S.mark);
+  $("rotdir").checked = !!S.rot_dir;
+  if (S.scale24 !== undefined) $("scale24").value = S.scale24;
   $("caljson").value = JSON.stringify({ axis1: S.axis1, axis2: S.axis2 });
 }
 function read_setup() {
   S.flip = $("flip").checked; S.mirror = $("mirror").checked;
+  S.ccw = $("ccw").checked;
+  S.rot_h = parseFloat($("roth").value) || 0;
+  S.rot_m = parseFloat($("rotm").value) || 0;
+  S.mark = parseFloat($("mark").value);
+  S.rot_dir = $("rotdir").checked;
+  const sv = parseFloat($("scale24").value);
+  S.scale24 = isFinite(sv) ? sv : undefined;
+  if (!isFinite(S.mark)) S.mark = 10.5;
   S.lat = parseFloat($("lat").value) || 0; S.lon = parseFloat($("lon").value) || 0;
   S.axis1.zero = parseFloat($("z1").value) || 0;
   S.axis1.sign = parseFloat($("g1").value);
@@ -474,13 +551,32 @@ $("q").oninput = draw_list;
 $("kind").onchange = draw_list;
 ["lat", "lon", "z1", "z2"].forEach(id => { $(id).onchange = read_setup; });
 ["g1", "g2"].forEach(id => { $(id).onchange = read_setup; });
-["flip", "mirror"].forEach(id => { $(id).onchange = () => { read_setup(); draw_align(); }; });
+["flip", "mirror", "ccw", "roth", "rotm", "mark", "scale24", "rotdir"].forEach(id => { $(id).onchange = () => { read_setup(); draw_align(); }; });
 $("syncbtn").onclick = do_sync;
 $("twostar").onclick = two_star;
 $("geo").onclick = () => navigator.geolocation.getCurrentPosition((p) => {
   S.lat = +p.coords.latitude.toFixed(4); S.lon = +p.coords.longitude.toFixed(4);
   save(); fill_setup(); read_setup();
 }, () => { $("calnote").textContent = "The phone would not give its position."; });
+$("learn").onclick = () => {
+  const sv = parseFloat($("scale24").value);
+  if (!isFinite(sv)) {
+    $("rotnote").textContent = "Type what the fixed scale reads first.";
+    return;
+  }
+  // the drawing currently matches the eyepiece at the manual rotation, and the scale
+  // says this: the difference between them is the offset, and it never changes again
+  const dir = S.rot_dir ? -1 : 1;
+  S.rot_off = sv - manualRot() / dir;
+  S.scale24 = sv;
+  save(); fill_setup(); draw_align();
+  $("rotnote").textContent = "Learnt. From now on, type the scale reading and nothing "
+    + "else. (offset " + S.rot_off.toFixed(3) + " h)";
+};
+$("rotplus").onclick = () => { S.rot_h = (S.rot_h || 0) + 1; save();
+  fill_setup(); draw_align(); };
+$("rotminus").onclick = () => { S.rot_h = (S.rot_h || 0) - 1; save();
+  fill_setup(); draw_align(); };
 $("calcopy").onclick = () => { $("caljson").select();
   try { document.execCommand("copy"); } catch (e) {} };
 $("calload").onclick = () => {

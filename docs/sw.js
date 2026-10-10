@@ -5,7 +5,7 @@
 // reported, and rightly so. The page is now fetched from the network when there is
 // any, with the cache kept fresh behind it and used only when the network fails.
 // Everything else (icon, manifest) is static, so cache-first suits it.
-const CACHE = "nout-pointing-v3";
+const CACHE = "nout-pointing-v4";
 const FILES = ["./", "./index.html", "./icon.png", "./manifest.webmanifest"];
 
 self.addEventListener("install", (e) => {
