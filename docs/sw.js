@@ -1,6 +1,6 @@
 // Keeps the page working with no network at all — which is the point of it: you are
 // in a field, the phone has no signal, and the pointing maths needs nothing anyway.
-const CACHE = "nout-pointing-v1";
+const CACHE = "nout-pointing-v2";
 const FILES = ["./", "./index.html", "./icon.png", "./manifest.webmanifest"];
 
 self.addEventListener("install", (e) => {
