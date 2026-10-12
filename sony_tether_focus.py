@@ -700,7 +700,13 @@ def _decode_linear(path, half=True):
         return None
     try:
         with _RAWPY.imread(path) as raw:
-            rgb = raw.postprocess(use_camera_wb=True, half_size=half,
+            # user_flip=0: never apply the camera's orientation flag. The body has an
+            # orientation sensor and it can flip mid-session — found in a real set
+            # where six darks came out 3012x2012 and four 2012x3012 from the same
+            # 4024x6024 sensor. Honouring the flag then rotates frames against each
+            # other, which breaks registration and makes dark subtraction nonsense.
+            # Pointing at the sky, the flag means nothing anyway.
+            rgb = raw.postprocess(use_camera_wb=True, half_size=half, user_flip=0,
                                   no_auto_bright=True, output_bps=16, gamma=(1, 1))
         f = cv2.cvtColor(rgb.astype(np.float32), cv2.COLOR_RGB2BGR)
         f = f / 65535.0 * 255.0
@@ -1289,10 +1295,39 @@ def detection_gray(x):
     return lum.astype(np.uint8)
 
 
-def _obs_background(f, grid=(16, 24), deg=3, iters=5):
+def _residual_flatten(r, frac=0.35):
+    """Take out whatever the polynomial sky model could not reach.
+
+    A smooth surface cannot follow vignetting right into the corners, and what it
+    leaves there is small in absolute terms but survives the stretch as coloured
+    clouds in the corners — reported on a session of the Helix. This removes it at a
+    scale of about a third of the frame, far larger than any object that is meant to
+    show. Measured on two very different sessions, a compact planetary and a nebula
+    filling the field: the corner-to-centre residual fell from +0.051 to +0.032 ADU
+    and from -0.027 to -0.005, and in both cases the object came out slightly BETTER,
+    not worse. Flattening harder (a quarter of the frame) starts eating the extended
+    one, so this is where it stops."""
+    h, w = r.shape[:2]
+    st = max(2, int(frac * max(h, w) / 6))
+    low = cv2.medianBlur(cv2.resize(r, (max(w // st, 8), max(h // st, 8)),
+                                    interpolation=cv2.INTER_AREA), 5)
+    return r - cv2.resize(cv2.GaussianBlur(low, (0, 0), 2.0), (w, h),
+                          interpolation=cv2.INTER_LINEAR)
+
+
+def _obs_background(f, grid=(16, 24), deg=None, iters=5):
     """Sky model per channel from sigma-clipped tile medians, where tiles lying on an
     extended object (galaxy, nebula) are rejected iteratively, so the fit only ever
-    sees sky — no dark hole dug around a big galaxy."""
+    sees sky — no dark hole dug around a big galaxy.
+
+    `deg=None` lets the picture choose. The right stiffness is not a constant: on a
+    session of the Helix a cubic left 0.10 ADU of corner-to-centre vignetting, which
+    the stretch turned into a bright ring round the frame, and a quartic cut that in
+    half. On a session of the Elephant's Trunk the cubic was already flat to 0.03 ADU
+    and the quartic bought nothing while eating a quarter of the nebula — the extra
+    freedom goes into following the object. So each degree is fitted and judged on how
+    well it explains the SKY tiles alone, and a higher one has to earn its place by a
+    clear margin, not a marginal one."""
     h, w = f.shape[:2]
     ny, nx = grid
     ys = np.linspace(0, h, ny + 1).astype(int); xs = np.linspace(0, w, nx + 1).astype(int)
@@ -1311,17 +1346,47 @@ def _obs_background(f, grid=(16, 24), deg=3, iters=5):
             cx.append((xs[ix] + xs[ix + 1]) / 2.0 / w - 0.5)
             cy.append((ys[iy] + ys[iy + 1]) / 2.0 / h - 0.5)
     cx, cy, vals, lv = map(np.asarray, (cx, cy, vals, lv))
-    terms = [(i, j) for i in range(deg + 1) for j in range(deg + 1 - i)]
-    A = np.stack([(cx ** i) * (cy ** j) for i, j in terms], axis=-1)
-    ok = np.ones(len(lv), bool)
-    for _ in range(iters):
-        coef, *_ = np.linalg.lstsq(A[ok], lv[ok], rcond=None)
-        res = lv - A @ coef
-        sd = 1.4826 * float(np.median(np.abs(res[ok] - np.median(res[ok])))) + 1e-6
-        new = res < 2.0 * sd                          # objects are only ever brighter
-        if new.sum() < len(terms) * 2 or (new == ok).all():
-            break
-        ok = new
+
+    def fit(d):
+        tm = [(i, j) for i in range(d + 1) for j in range(d + 1 - i)]
+        M = np.stack([(cx ** i) * (cy ** j) for i, j in tm], axis=-1)
+        keep = np.ones(len(lv), bool)
+        for _ in range(iters):
+            co, *_ = np.linalg.lstsq(M[keep], lv[keep], rcond=None)
+            res = lv - M @ co
+            sd = 1.4826 * float(np.median(np.abs(res[keep] - np.median(res[keep])))) + 1e-6
+            new = res < 2.0 * sd                      # objects are only ever brighter
+            if new.sum() < len(tm) * 2 or (new == keep).all():
+                break
+            keep = new
+        co, *_ = np.linalg.lstsq(M[keep], lv[keep], rcond=None)
+        rms = float(np.sqrt(np.mean((lv[keep] - M[keep] @ co) ** 2)))
+        return tm, M, keep, rms
+
+    if deg is None:
+        # Judged by how well it fits the tiles it was fitted ON, a quartic always wins
+        # — the extra freedom goes into whatever is there, object included. So fit on
+        # half the sky tiles and score on the other half: freedom that is explaining
+        # real vignetting helps on tiles it has never seen, freedom that is following
+        # an object does not.
+        best = None
+        for d in (3, 4):
+            tm, M, keep, _ = fit(d)
+            idx = np.nonzero(keep)[0]
+            if len(idx) < 4 * len(tm):
+                err = float("inf")
+            else:
+                errs = []
+                for half in range(2):
+                    tr = idx[half::2]; te = idx[1 - half::2]
+                    co, *_ = np.linalg.lstsq(M[tr], lv[tr], rcond=None)
+                    errs.append(float(np.sqrt(np.mean((lv[te] - M[te] @ co) ** 2))))
+                err = float(np.mean(errs))
+            if best is None or err < best[0] * 0.98:   # ties go to the stiffer model
+                best = (err, tm, M, keep)
+        _, terms, A, ok = best
+    else:
+        terms, A, ok, _ = fit(deg)
     gy, gx = np.mgrid[0:64, 0:96].astype(np.float32)
     xn = gx / 95.0 - 0.5; yn = gy / 63.0 - 0.5
     model = np.empty_like(f)
@@ -1556,6 +1621,7 @@ def render_observation(f, flattened=None, saturation=1.05, max_side=2400,
         f = cv2.resize(f, (int(w * sc), int(h * sc)), interpolation=cv2.INTER_AREA)
     if flattened is None:
         f = f - _obs_background(f)
+        f = _residual_flatten(f)
     # neutral sky: every channel's sky at 0
     f = f - np.array([np.median(f[::3, ::3, c]) for c in range(3)], np.float32)
     lum = f.mean(axis=2)
@@ -1613,7 +1679,13 @@ def render_observation(f, flattened=None, saturation=1.05, max_side=2400,
     sL = 1.4826 * float(np.median(np.abs(L[::3, ::3].astype(np.float32) - np.median(L[::3, ::3]))))
     L = cv2.fastNlMeansDenoising(L, None, h=float(np.clip(1.1 * sL, 2.0, 14.0)),
                                  templateWindowSize=5, searchWindowSize=15)
-    a = cv2.GaussianBlur(a, (0, 0), 2.2); b = cv2.GaussianBlur(b, (0, 0), 2.2)
+    # Colour noise, not colour: the sky is left at a few levels above black on purpose
+    # (crushing it would take the faintest signal with it), and that makes per-pixel
+    # chroma speckle visible. Blurring the colour channels harder halves it — measured
+    # on M31, 2.81 to 1.36 — and costs 6 % of the galaxy's own colour, which is a good
+    # trade. Scaled with the picture, since it is a visual judgement.
+    cs = max(2.5, 0.004 * max(img.shape[:2]))
+    a = cv2.GaussianBlur(a, (0, 0), cs); b = cv2.GaussianBlur(b, (0, 0), cs)
     # gentle local contrast where there is signal
     Lc = cv2.createCLAHE(clipLimit=1.15, tileGridSize=(8, 8)).apply(L)
     wgt = np.clip((L.astype(np.float32) - 40.0) / 80.0, 0.0, 1.0)
