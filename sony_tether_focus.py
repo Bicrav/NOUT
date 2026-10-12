@@ -7289,9 +7289,15 @@ class BahtinovDialog(QtWidgets.QDialog):
         self._best = None
         v = QtWidgets.QVBoxLayout(self)
         v.addWidget(_hint(
-            "Fit the mask over the objective and point at a bright star — a second or "
-            "third magnitude one is plenty; too bright and the spikes burn out. Keep "
-            "the live view running and the star roughly centred.<br><br>"
+            "Fit the mask over the objective and point at a bright star. Keep it "
+            "roughly centred.<br><br>"
+            "<b>The live view often will not show the spikes.</b> It is a 1024×680 "
+            "compressed stream at a short exposure, and a diffraction spike is thin "
+            "and faint — the reduction alone loses it. That is the camera, not a "
+            "fault. Two ways round it: pick a really bright star (Vega, Capella, "
+            "Deneb), or simply take photos of one or two seconds while this window is "
+            "open — it reads those too, at full size, where the spikes are obvious. "
+            "The line below says which it is reading.<br><br>"
             "Turn the focuser slowly and watch the number. It is the distance between "
             "the middle spike and the crossing of the other two, so best focus is "
             "zero. Which way to turn is not something the mask can tell you: move a "
@@ -7313,6 +7319,28 @@ class BahtinovDialog(QtWidgets.QDialog):
         self.verdict = QtWidgets.QLabel("Point at a star with the mask on.")
         self.verdict.setAlignment(Qt.AlignCenter); self.verdict.setWordWrap(True)
         right.addWidget(self.verdict)
+        arow = QtWidgets.QHBoxLayout()
+        self.auto = QtWidgets.QCheckBox("Shoot by itself")
+        self.auto.setToolTip("Takes one photo after another and reads each one, so you "
+                             "can keep both hands on the focuser. It stops on its own "
+                             "once the reading has settled, and puts the shutter speed "
+                             "back where it found it.")
+        self.auto.toggled.connect(self._toggle_auto)
+        arow.addWidget(self.auto)
+        arow.addWidget(QtWidgets.QLabel("at"))
+        self.expo = QtWidgets.QComboBox()
+        for t in ("1/2", "1", "2", "4"):
+            self.expo.addItem(t + " s", t)
+        self.expo.setCurrentIndex(2)
+        self.expo.setToolTip("Two seconds shows the spikes on almost any star. Shorter "
+                             "is quicker — each frame costs its exposure plus about "
+                             "three seconds of transfer.")
+        arow.addWidget(self.expo)
+        self.auto_msg = QtWidgets.QLabel(""); self.auto_msg.setObjectName("cap")
+        self.auto_msg.setWordWrap(True)
+        arow.addWidget(self.auto_msg, 1)
+        v.addLayout(arow)
+
         trow = QtWidgets.QHBoxLayout()
         trow.addWidget(QtWidgets.QLabel("In focus under"))
         self.tol = QtWidgets.QDoubleSpinBox(); self.tol.setRange(0.2, 5.0)
@@ -7342,13 +7370,71 @@ class BahtinovDialog(QtWidgets.QDialog):
         v.addLayout(foot)
 
     def _clear(self):
-        self._hist = []; self._best = None
+        self._hist = []; self._best = None; self._settled = 0
         self.curve.setData([])
 
-    def feed(self, frame):
-        """One live-view frame."""
+    # ---- shooting on its own ---------------------------------------------
+    def _toggle_auto(self, on):
+        win = self.parent()
+        if win is None:
+            return
+        if on:
+            self._settled = 0
+            self._shutter_before = None
+            try:
+                self._shutter_before = win.cb_shutter.currentText()
+            except Exception:           # noqa: BLE001
+                pass
+            want = self.expo.currentData()
+            try:
+                win.worker.post("set_config", name="shutterspeed", value=want)
+            except Exception:           # noqa: BLE001
+                pass
+            secs = _parse_exposure_seconds(want) or 2.0
+            self.auto_msg.setText(
+                "Shooting at {} s into a focus folder of its own — about {:.0f} s a "
+                "frame, most of it the transfer.".format(want, secs + 3.2))
+            self._shoot_next()
+        else:
+            back = getattr(self, "_shutter_before", None)
+            if back:
+                try:
+                    win.worker.post("set_config", name="shutterspeed", value=back)
+                    self.auto_msg.setText("Stopped — shutter speed put back to {}."
+                                          .format(back))
+                except Exception:       # noqa: BLE001
+                    self.auto_msg.setText("Stopped. Put the shutter speed back to {} "
+                                          "yourself.".format(back))
+            else:
+                # never leave someone shooting lights at the focus exposure without
+                # knowing it
+                self.auto_msg.setText("Stopped. The shutter is still at {} — set it "
+                                      "back before you shoot."
+                                      .format(self.expo.currentData()))
+
+    def _shoot_next(self):
+        """One more photo, into a folder of its own so focus frames never land among
+        the lights."""
+        if not self.auto.isChecked() or not self.isVisible():
+            return
+        win = self.parent()
+        try:
+            d = os.path.join(win.dir_edit.text(), "focus")
+            os.makedirs(d, exist_ok=True)
+            win.worker.post("capture", save_dir=d)
+        except Exception as e:          # noqa: BLE001
+            self.auto_msg.setText("Could not take a photo: {}".format(e))
+            self.auto.setChecked(False)
+
+    def feed(self, frame, source="live view"):
+        """One frame — from the live view, or from a photo, which is far better.
+
+        At 1024x680 and compressed, the live view keeps little of a diffraction spike;
+        a one or two second exposure at full size keeps all of it. Reported from the
+        field, and expected: nothing is wrong with the camera."""
         if frame is None or not self.isVisible():
             return
+        self._source = source
         try:
             g = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY) if frame.ndim == 3 else frame
             r = bahtinov_error(g)
@@ -7368,7 +7454,16 @@ class BahtinovDialog(QtWidgets.QDialog):
             self.big.setText("{:+.2f} px".format(err))
             if abs(err) <= tol:
                 self.verdict.setText("In focus. Take the mask off.")
+                self._settled = getattr(self, "_settled", 0) + 1
+                if self.auto.isChecked() and self._settled >= 3:
+                    # three readings in a row inside tolerance: it is not going to get
+                    # better by taking more pictures of it
+                    self.auto.setChecked(False)
+                    self.auto_msg.setText("Focus reached and held for three frames — "
+                                          "stopped. Take the mask off.")
+                    return
             else:
+                self._settled = 0
                 trend = ""
                 if len(self._hist) >= 4:
                     # Against the two readings just before, on the DISTANCE from focus.
@@ -7384,11 +7479,14 @@ class BahtinovDialog(QtWidgets.QDialog):
                 self.verdict.setText("Off focus by {:.2f} px{}".format(abs(err), trend))
             if self._best is None or abs(err) < abs(self._best):
                 self._best = err
-            self.detail.setText("spikes {:.0f}° apart, at {}  ·  best so far {:+.2f} px"
-                                .format(r["sep_deg"],
-                                        ", ".join("{:.0f}°".format(a) for a in r["angles"]),
-                                        self._best))
+            self.detail.setText(
+                "spikes {:.0f}° apart, at {}  ·  best so far {:+.2f} px  ·  read from "
+                "the {}".format(r["sep_deg"],
+                                ", ".join("{:.0f}°".format(a) for a in r["angles"]),
+                                self._best, getattr(self, "_source", "live view")))
             self._draw(g, r)
+            if source == "photo" and self.auto.isChecked():
+                QtCore.QTimer.singleShot(200, self._shoot_next)
         except Exception:               # noqa: BLE001 - a bad frame must not stop focusing
             pass
 
@@ -12727,6 +12825,12 @@ class MainWindow(QtWidgets.QMainWindow):
     @Slot(object, str)
     def on_capture_image(self, img, caption):
         self._series_frames = getattr(self, "_series_frames", 0) + 1
+        bd = getattr(self, "_baht_dlg", None)
+        if bd is not None and bd.isVisible() and img is not None:
+            # The live view is a 1024x680 compressed stream at a short exposure, and
+            # the mask's spikes are faint and thin: the reduction alone loses them.
+            # On a real exposure at full size they are obvious, so read those too.
+            bd.feed(img, source="photo")
         if img is not None:
             self._exposure_hint(img)
         if img is not None and self.chk_track.isChecked() \
