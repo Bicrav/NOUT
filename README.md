@@ -40,6 +40,15 @@ one or two stars. It needs no network, no camera and no mount connection — a m
 GoTo is pure arithmetic — so it runs offline on a phone while the computer stays at
 home. Its readings match the Python to 1e-13 degrees.
 
+**Showing faint things** — nebulosity sits at a few per cent of the sky: measured on
+a real session it came to 3 % of the sky level and 1/2500 of the brightest star, at a
+signal-to-noise of 1.2 per pixel, which no stretch can reveal because it is under the
+noise rather than under the black point. The display separates the smooth sky from the
+stars, averages only the smooth part, and puts the stars back sharp — the same stack
+then shows the nebula at 21 levels of contrast instead of 12. A "nebulosity only" view
+takes the stars out altogether, with StarNet++ when it is installed (3042 stars to 21,
+about ten seconds) and a built-in separation otherwise.
+
 **Focus** — a Bahtinov mask reader: the three diffraction spikes are found with a Radon
 transform and the middle one's distance from the crossing of the other two is the focus
 error, to a tenth of a pixel. Also live sharpness metrics and star-count focusing.

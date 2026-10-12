@@ -1145,6 +1145,44 @@ def bahtinov_error(gray, centre=None, size=256):
             "sep_deg": float(np.degrees(sep)), "roi": (x0, y0, size),
             "lines": [(float(t), float(p)) for t, p in (a, mid, b)]}
 
+#: Full-well capacity in electrons at base ISO, for turning raw levels into
+#: electrons. Measured for the body this was built against; anything else gets a
+#: typical full-frame value and the reading is then indicative rather than exact.
+_FULL_WELL = {"ILCE-7M2": 65656.0}
+_READ_NOISE = {"ILCE-7M2": ((100, 3.8), (200, 2.9), (400, 2.1), (800, 1.61),
+                            (1600, 1.60), (3200, 1.58), (6400, 1.57))}
+
+
+def sky_limited_ratio(path, iso, model=""):
+    """How far the sky background's own noise beats the camera's read noise.
+
+    This — not a percentage of the histogram — is what says whether a sub is long
+    enough. The sky brings shot noise of sqrt(S) electrons; the camera adds R of its
+    own whatever you do. Once S is several times R², lengthening the sub buys you
+    almost nothing and the only thing left to do is take more of them. A DARK sky is
+    the goal, so judging the exposure by how bright the frame looks gets it exactly
+    backwards: measured on real frames from this rig, perfectly good 20 s subs sat at
+    1–6 % of the preview histogram and were called under-exposed.
+
+    Returns (ratio, sky_electrons, read_noise) or None if the file says nothing."""
+    try:
+        import rawpy
+        with rawpy.imread(path) as raw:
+            black = float(np.mean(raw.black_level_per_channel))
+            sky = float(np.median(raw.raw_image_visible))
+            bits = 14 if raw.white_level > 4095 else 12
+    except Exception:                   # noqa: BLE001  (JPEG, or no rawpy)
+        return None
+    key = next((k for k in _FULL_WELL if k in (model or "")), None)
+    fwc = _FULL_WELL.get(key, 50000.0)
+    curve = _READ_NOISE.get(key, ((100, 4.0), (800, 2.0), (3200, 1.8)))
+    iso = float(iso or 800)
+    gain = (fwc / (2 ** bits - 1)) * (100.0 / max(iso, 50.0))     # electrons per ADU
+    rn = min(curve, key=lambda c: abs(math.log(max(c[0], 1) / iso)))[1]
+    sky_e = max(sky - black, 0.0) * gain
+    return sky_e / (rn * rn), sky_e, rn
+
+
 CALIBRATION_TYPES = ("flats", "darks", "biases", "bias", "dark", "flat", "offset")
 
 
@@ -1296,7 +1334,208 @@ def _obs_background(f, grid=(16, 24), deg=3, iters=5):
     return model
 
 
-def render_observation(f, flattened=None, saturation=1.05, max_side=2400):
+_STARNET_EXE = None
+_STARNET_TRIED = False
+
+
+def starnet_exe():
+    """Where StarNet++ lives, if it is installed. Found once, like GraXpert."""
+    global _STARNET_EXE, _STARNET_TRIED
+    if _STARNET_TRIED:
+        return _STARNET_EXE
+    _STARNET_TRIED = True
+    saved = QtCore.QSettings("NOUT", "NOUT").value("starnet_exe", "", type=str)
+    cands = [saved] if saved else []
+    cands += ["/Applications/StarNetv2CLI_MacOS/starnet++",
+              "/usr/local/bin/starnet++", "/opt/homebrew/bin/starnet++",
+              os.path.expanduser("~/StarNetv2CLI_MacOS/starnet++"),
+              shutil.which("starnet++") or ""]
+    for c in cands:
+        if c and os.path.isfile(c) and os.access(c, os.X_OK):
+            _STARNET_EXE = c
+            break
+    return _STARNET_EXE
+
+
+def starnet_starless(img8, timeout=180.0):
+    """Stars removed by StarNet++, which is what it is for and does far better than
+    anything a median filter can manage.
+
+    It wants a stretched 16-bit TIFF, so this is a step for the DISPLAY, after the
+    stretch — not for the linear stack. Returns None when StarNet is not installed or
+    does not answer, and the caller falls back to the built-in separation."""
+    exe = starnet_exe()
+    if exe is None or img8 is None:
+        return None
+    import tempfile
+    d = tempfile.mkdtemp(prefix="nout-starnet-")
+    src, dst = os.path.join(d, "in.tif"), os.path.join(d, "out.tif")
+    try:
+        cv2.imwrite(src, (np.clip(img8, 0, 255).astype(np.uint16) * 257))
+        # it loads its weights from its own directory, so it has to run there
+        subprocess.run([exe, src, dst], cwd=os.path.dirname(exe), timeout=timeout,
+                       capture_output=True)
+        if not os.path.exists(dst):
+            return None
+        out = cv2.imread(dst, cv2.IMREAD_UNCHANGED)
+        return None if out is None else (out // 257).astype(np.uint8)
+    except Exception:               # noqa: BLE001  (not installed, killed, out of memory)
+        return None
+    finally:
+        shutil.rmtree(d, ignore_errors=True)
+
+
+def starless(f):
+    """The sky with its stars taken out, leaving the nebulosity on its own.
+
+    A median wide enough to swallow a star core, then the brightest leftovers filled
+    in from around them. It is not what a trained network does — there is no attempt
+    to reconstruct what was behind a star — but for looking at faint nebulosity while
+    it builds up, taking the stars away is most of the battle: they are what the eye
+    locks onto, and what the stretch spends its range on."""
+    f = f.astype(np.float32)
+    h, w = f.shape[:2]
+    # A median wide enough for a star core would need a kernel OpenCV will not take in
+    # floating point, so it is done on a reduced copy — the same thing, and cheaper.
+    step = max(2, int(round(0.004 * max(h, w))))
+    smallf = cv2.resize(f, (max(w // step, 8), max(h // step, 8)),
+                        interpolation=cv2.INTER_AREA)
+    sky = cv2.resize(cv2.medianBlur(smallf, 5), (w, h), interpolation=cv2.INTER_LINEAR)
+    # whatever still stands well above that is a star the median could not swallow:
+    # paint it over with the sky around it
+    resid = (f - sky).mean(axis=2)
+    rn = 1.4826 * float(np.median(np.abs(resid - np.median(resid)))) + 1e-9
+    mask = cv2.dilate((resid > 4.0 * rn).astype(np.uint8), np.ones((5, 5), np.uint8))
+    m = cv2.GaussianBlur(mask.astype(np.float32), (0, 0), 2.0)[..., None]
+    wide = cv2.resize(cv2.medianBlur(
+        cv2.resize(sky, (max(w // (step * 2), 8), max(h // (step * 2), 8)),
+                   interpolation=cv2.INTER_AREA), 5), (w, h),
+        interpolation=cv2.INTER_LINEAR)
+    sky = sky * (1 - m) + wide * m
+    # With the stars gone the vignetting is the only thing left that is not sky, and a
+    # background fit finally has nothing to trip over — so it is worth doing again
+    # here. Without this the corners keep the whole stretch to themselves and the
+    # nebula is a faint smudge inside a bright ring.
+    return sky - _obs_background(sky)
+
+
+def reveal_faint(f, strength=1.0):
+    """Lift faint extended signal out of the noise, leaving the stars sharp.
+
+    Nebulosity sits at a few per cent of the sky. Measured on a real session — 40 subs
+    of 30 s on the Elephant's Trunk, an unmodified camera at 357 mm — the emission came
+    to 3 % of the sky level and 1/2500 of the brightest star, and reached the screen at
+    12 levels of contrast against 21 levels of noise: present, but under the grain, so
+    nothing was visible. No curve can fix that, because the signal is not below the
+    black point, it is below the noise.
+
+    Averaging is the only cure, and it must not touch the stars. So the frame is split:
+    a median filter gives the smooth sky, and what it leaves is stars AND noise — the
+    distinction matters, since adding all of it back after smoothing puts the noise
+    straight back, which is exactly what a first attempt did (21.5 levels of noise
+    became 21.2, for nothing). Only excursions well above the noise are kept as stars.
+
+    With that, the same stack puts the nebula at 21 levels instead of 12 and it becomes
+    visible on screen. Bright compact objects — a planetary, a galaxy core — stand far
+    above the noise too, so they ride in the star layer and keep their edges."""
+    base = cv2.medianBlur(f.astype(np.float32), 5)        # the sky without its stars
+    resid = f - base
+    rl = resid.mean(axis=2)
+    rn = 1.4826 * float(np.median(np.abs(rl - np.median(rl)))) + 1e-9
+    keep = np.clip((rl - 2.5 * rn) / (2.5 * rn), 0.0, 1.0)[..., None]
+    # a few pixels at the size the picture is shown, so it does not depend on the stack
+    sigma = max(1.0, 0.0029 * max(f.shape[:2]) * float(strength))
+    return cv2.GaussianBlur(base, (0, 0), sigma) + resid * keep
+
+
+def lift_nebulosity(img8, target_sd=15.0, target_median=64.0):
+    """Bring up what is left once StarNet has taken the stars away.
+
+    The stars were carrying most of the brightness, so their removal leaves a picture
+    that is nearly black even though the nebulosity is right there. The scale is set
+    from the same figures the same data gives through Siril — a median of 64 levels
+    and a spread of about 15 — so the result is the low-contrast, nearly neutral thing
+    this signal honestly is, rather than a stretched blotch."""
+    g = img8.astype(np.float32)
+    h, w = g.shape[:2]
+    core = g[int(0.06 * h):int(0.94 * h), int(0.06 * w):int(0.94 * w)]
+    # the vignetting the sky model could not reach would take the whole range again
+    low = cv2.resize(cv2.medianBlur(
+        cv2.resize(g, (max(w // 40, 8), max(h // 40, 8)), interpolation=cv2.INTER_AREA),
+        5), (w, h), interpolation=cv2.INTER_LINEAR)
+    g = g - low
+    core = g[int(0.06 * h):int(0.94 * h), int(0.06 * w):int(0.94 * w)]
+    sd = float(np.std(core.mean(axis=2)))
+    if sd < 1e-6:
+        return np.full((h, w, 3), int(target_median), np.uint8)
+    out = target_median + (g - float(np.median(core))) * (target_sd / sd)
+    return np.clip(out, 0, 255).astype(np.uint8)
+
+
+def render_nebulosity(f, saturation=1.05, target_sd=15.0, target_median=64.0):
+    """Nebulosity on its own, rendered the way this signal honestly looks.
+
+    Two earlier attempts were ugly and were called so. The first ran the star-field
+    look on a starless frame: with the stars gone the brightest thing left was the
+    vignetting, so the stretch spent its range on a bright ring and the sharpening
+    downstream turned the rest into coloured blotches. The second clipped percentiles
+    and stretched pure noise across the full range.
+
+    The target here is measured, not guessed: the same data through Siril comes out at
+    a median of 64 levels, a standard deviation of 14.5, structure at the scale of a
+    nebula of under 3 levels, and almost no colour (a 3.0, b 3.9). That is what a weak
+    smooth signal looks like when it is shown honestly — dark grey and low contrast,
+    not a painting. So: take out anything broader than the structures, smooth until the
+    grain is about what Siril's is, scale so the spread matches, and keep the colour
+    nearly neutral."""
+    g = starless(f).astype(np.float32)
+    h, w = g.shape[:2]
+    # The outer border is vignetted, carries no usable signal, and is exactly what a
+    # smooth model cannot follow — a blur there folds back on itself and leaves a
+    # bright ring that then takes the whole stretch. Cut it off rather than fight it.
+    m = int(0.05 * max(h, w))
+    g = g[m:h - m, m:w - m]
+    h, w = g.shape[:2]
+    # Background at large scale by MEDIAN, not by blur: a nebula covering a good part
+    # of the frame pulls a mean upwards and ends up subtracting itself.
+    st = max(2, int(0.02 * max(h, w)))
+    low = cv2.resize(g, (max(w // st, 8), max(h // st, 8)), interpolation=cv2.INTER_AREA)
+    low = cv2.medianBlur(low, 5)
+    g = g - cv2.resize(cv2.GaussianBlur(low, (0, 0), 2.0), (w, h),
+                       interpolation=cv2.INTER_LINEAR)
+    # Smooth just enough, and no more. The structures live at 8 to 32 px on a 1400 px
+    # frame (measured on this same data through Siril) with an amplitude of 1 to 2
+    # levels against 5.6 levels of grain — below the noise, and readable only because
+    # an eye integrates over an area. Doing that integration explicitly is the point
+    # of this view; doing too much of it turns the sky into soup, which is what a
+    # fixed amount did as soon as the stack got deeper and the grain fell.
+    gl = g.mean(axis=2)
+    grain = 1.4826 * float(np.median(np.abs(gl - cv2.GaussianBlur(gl, (0, 0), 2.0))))
+    structure = 1.4826 * float(np.median(np.abs(
+        cv2.GaussianBlur(gl, (0, 0), 8.0) - cv2.GaussianBlur(gl, (0, 0), 32.0))))
+    sigma = 2.0 * grain / max(structure, 1e-9)
+    sigma = float(np.clip(sigma, 1.5, 0.016 * max(h, w)))
+    g = cv2.GaussianBlur(g, (0, 0), sigma)
+    core = g[int(0.12 * h):int(0.88 * h), int(0.12 * w):int(0.88 * w)]
+    lum = core.mean(axis=2)
+    sd = float(np.std(lum))
+    if sd < 1e-9:
+        return np.full((h, w, 3), int(target_median), np.uint8)
+    k = target_sd / sd
+    out = target_median + (g - float(np.median(core))) * k
+    img = np.clip(out, 0, 255).astype(np.uint8)
+    # the colour of a signal this faint is mostly noise: keep a hint of it, no more
+    lab = cv2.cvtColor(img, cv2.COLOR_BGR2LAB)
+    L, a, b = cv2.split(lab)
+    a = cv2.GaussianBlur(a, (0, 0), 4.0); b = cv2.GaussianBlur(b, (0, 0), 4.0)
+    sat = float(np.clip(0.35 * saturation, 0.1, 0.8))
+    a = np.clip(128 + (a.astype(np.float32) - 128) * sat, 0, 255).astype(np.uint8)
+    b = np.clip(128 + (b.astype(np.float32) - 128) * sat, 0, 255).astype(np.uint8)
+    return cv2.cvtColor(cv2.merge([L, a, b]), cv2.COLOR_LAB2BGR)
+
+
+def render_observation(f, flattened=None, saturation=1.05, max_side=2400,
+                      hide_stars=False):
     """Smart-telescope look for the live stack: flat neutral sky, colour-true stars,
     galaxy cores that do not burn out, clean background — made to be shown.
 
@@ -1332,6 +1571,16 @@ def render_observation(f, flattened=None, saturation=1.05, max_side=2400):
     # is truly green, so green above the red/blue average is the sensor's, not the sky's
     f[..., 1] = np.minimum(f[..., 1], 0.5 * (f[..., 0] + f[..., 2]) +
                            0.02 * np.abs(f[..., 1]))
+    # Before stretching: give the faint extended signal a chance of being above the
+    # noise at all, or no curve downstream can bring it out.
+    if hide_stars:
+        shown = render_observation(f, flattened=flattened, saturation=saturation,
+                                   max_side=max_side)
+        sn = starnet_starless(shown)
+        if sn is not None:
+            return lift_nebulosity(sn)
+        return render_nebulosity(f, saturation=saturation)
+    f = reveal_faint(f)
     lum = f.mean(axis=2)
     # colour-preserving arcsinh stretch on luminance
     noise = 1.4826 * float(np.median(np.abs(lum[::3, ::3] - np.median(lum[::3, ::3])))) + 1e-6
@@ -5146,14 +5395,16 @@ class ObsRenderWorker(QtCore.QThread):
     """Renders the Observation look off the GUI thread (denoising takes ~0.5 s)."""
     done = Signal(object)
 
-    def __init__(self, src, flat, saturation, max_side=2400):
+    def __init__(self, src, flat, saturation, max_side=2400, hide_stars=False):
         super().__init__()
         self.src, self.flat, self.sat, self.max_side = src, flat, saturation, max_side
+        self.hide_stars = bool(hide_stars)
 
     def run(self):
         try:
             self.done.emit(render_observation(self.src, self.flat, saturation=self.sat,
-                                              max_side=self.max_side))
+                                              max_side=self.max_side,
+                                              hide_stars=self.hide_stars))
         except Exception as e:          # noqa: BLE001
             print("[NOUT] observation render failed:", e, file=sys.stderr, flush=True)
             self.done.emit(None)
@@ -5476,18 +5727,24 @@ class _SectionColumn(QtWidgets.QScrollArea):
         avail = self.viewport().height()
         for _ in range(len(self._secs)):
             if self._need() <= avail:
+                self._w.setMinimumHeight(0)       # it all fits: no scroll bar wanted
                 return
             # fold the least important first (sticky sections last), oldest first
             victims = sorted((s for s in self._order if s is not keep),
                              key=lambda s: (getattr(s, "sticky", 0), self._order.index(s)))
             if not victims:
-                return
+                break
             self._fitting = True
             try:
                 victims[0].set_expanded(False)
             finally:
                 self._fitting = False
             self._auto_folded.append(victims[0])
+        # Folding was not enough: the section being opened is taller on its own than
+        # the panel. Squeezing then wrecks the whole column — headers disappear and
+        # the content is cut off mid-control, which is what Framing / Mosaic did. A
+        # scroll bar for that one case is far better than a broken panel.
+        self._w.setMinimumHeight(self._need())
 
     def _reopen(self):
         """Give back what fit() folded, most recent first, as long as it fits."""
@@ -8507,6 +8764,7 @@ class MainWindow(QtWidgets.QMainWindow):
             "unlimited": self.chk_unlimited.isChecked(), "metric": self.metric_cb.currentText(),
             "roi": self.roi_slider.value(), "reticle_alpha": self.ret_slider.value(),
             "obs_look": self.chk_obs.isChecked(),
+            "starless": self.chk_starless.isChecked(),
             "live_source": (self.src_combo.currentData() or (None, ""))[1] or "",
             "live": self.chk_live.isChecked(),
             "metric_on": self.chk_metric.isChecked(), "stars": self.chk_stars.isChecked(),
@@ -8552,6 +8810,7 @@ class MainWindow(QtWidgets.QMainWindow):
         self.roi_slider.setValue(s.value("roi", int(self.roi_frac * 100), type=int))
         self.ret_slider.setValue(s.value("reticle_alpha", 85, type=int))
         self.chk_obs.setChecked(s.value("obs_look", True, type=bool))
+        self.chk_starless.setChecked(s.value("starless", False, type=bool))
         self._on_reticle_alpha(self.ret_slider.value())   # slider may not have moved
         # Come back on the HDMI card if it was in use and is plugged in again; never
         # switch to the Mac's own webcam on our own.
@@ -8950,12 +9209,11 @@ class MainWindow(QtWidgets.QMainWindow):
             lambda: self.worker.post("set_metric", name=self.metric_cb.currentText()))
         self.metric_cb.activated.connect(lambda *_: self._sync_hdmi())
         dl.addWidget(self.metric_cb)
-        self.baht_btn = QtWidgets.QPushButton("✳ Focus with a Bahtinov mask…")
+        self.baht_btn = QtWidgets.QPushButton("✳ Bahtinov focus…")
         self.baht_btn.setToolTip("Reads the three diffraction spikes of the mask on a "
                                  "bright star and tells you how far the middle one is "
                                  "from the crossing of the other two. Zero is focus.")
         self.baht_btn.clicked.connect(self._open_bahtinov)
-        dl.addWidget(self.baht_btn)
         self.roi_slider = QtWidgets.QSlider(Qt.Horizontal)
         self.roi_slider.setRange(10, 100); self.roi_slider.setValue(int(self.roi_frac * 100))
         self.roi_slider.valueChanged.connect(self._on_roi)
@@ -9112,6 +9370,14 @@ class MainWindow(QtWidgets.QMainWindow):
                                 "background. Off: the plain Siril-style stretch.")
         self.chk_obs.setChecked(True)
         self.chk_obs.toggled.connect(self._restretch)
+        self.chk_starless = QtWidgets.QCheckBox("Nebulosity only (no stars)")
+        self.chk_starless.setToolTip(
+            "Takes the stars out of the picture so only the nebulosity is left — the "
+            "stars carry most of the brightness and most of the attention. Uses "
+            "StarNet++ when it is installed, which does it far better than anything "
+            "built in, and falls back to a simpler separation otherwise. About ten "
+            "seconds per render, so the view updates less often.")
+        self.chk_starless.toggled.connect(self._restretch)
         self.chk_objs = QtWidgets.QCheckBox("Show sky objects (needs plate-solve) — beta")
         self.chk_objs.setToolTip("After a plate-solve, overlay catalog DSOs on the stack so "
                                  "you can see where the first faint details should appear.")
@@ -9416,6 +9682,8 @@ class MainWindow(QtWidgets.QMainWindow):
         for c in range(3):
             g.setColumnStretch(c, 1)
         sx.lay.addLayout(g)
+        sx.row(self.baht_btn)      # focusing belongs with the optics, and this is where
+                                   # the panel can actually be seen
 
         # Capture
         sc = col.add(_Section("Capture")); sc.sticky = 1      # the shooting buttons: fold last
@@ -9488,9 +9756,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.kappa_val.setPrefix(""); self.kappa_val.setDecimals(1)
         pg_ = QtWidgets.QGridLayout(); pg_.setHorizontalSpacing(8); pg_.setVerticalSpacing(3)
         for i, w in enumerate((self.chk_stack, self.chk_obs, self.chk_degrad,
-                               self.chk_stretch, self.chk_stack_full, self.chk_flats,
-                               self.chk_darks, self.chk_cull, self.chk_frame_reject,
-                               self.chk_objs, kbox)):
+                               self.chk_stretch, self.chk_starless, self.chk_stack_full,
+                               self.chk_flats, self.chk_darks, self.chk_cull,
+                               self.chk_frame_reject, self.chk_objs, kbox)):
             pg_.addWidget(w, i // 2, i % 2)
         pg_.setColumnStretch(0, 1); pg_.setColumnStretch(1, 1)
         sp.lay.addLayout(pg_)
@@ -12414,22 +12682,46 @@ class MainWindow(QtWidgets.QMainWindow):
         self._set_review_mode(False)
 
     def _exposure_hint(self, img):
-        """Sky level of the last frame, read like the camera's own histogram: the
-        background peak between ~1/7 and ~1/2 is where a 30 s sub is well used."""
-        try:
-            g = cv2.cvtColor(img[::4, ::4], cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img[::4, ::4]
-            pct = 100.0 * float(np.median(g)) / 255.0
-        except Exception:               # noqa: BLE001
-            return
-        if pct < 8:
-            txt = "Sky {:.0f}%  ·  under-exposed: raise ISO".format(pct)
-        elif pct < 14:
-            txt = "Sky {:.0f}%  ·  a little low".format(pct)
-        elif pct <= 45:
-            txt = "Sky {:.0f}%  ·  well exposed".format(pct)
+        """Is the sub long enough? Judged on the sky's noise against the camera's.
+
+        Reading it off the preview histogram, as this did, treats a dark sky as a
+        fault and told a perfectly good 20 s sub to raise its ISO. The honest measure
+        comes from the raw file, so it is taken from there — not on every frame, since
+        that costs a sixth of a second, but often enough to notice a change."""
+        now = time.monotonic()
+        path = getattr(self, "_last_capture_path", None)
+        if path and now - getattr(self, "_expo_at", 0.0) > 20.0:
+            self._expo_at = now
+            try:
+                r = sky_limited_ratio(path, _read_iso_exif(path),
+                                      getattr(self.worker, "model_name", lambda: "")())
+            except Exception:           # noqa: BLE001
+                r = None
+            if r is not None:
+                self._expo_last = r
+        r = getattr(self, "_expo_last", None)
+        if r is not None:
+            ratio, sky_e, rn = r
+            if ratio < 1.0:
+                verdict = "too short — the camera's own noise dominates"
+            elif ratio < 3.0:
+                verdict = "a bit short, but usable"
+            elif ratio < 10.0:
+                verdict = "good — the sky dominates, as it should"
+            elif ratio < 60.0:
+                verdict = "plenty; shorter subs would lose nothing"
+            else:
+                verdict = "very bright sky — shorten the subs or lower the ISO"
+            self._hud_info["br"] = "Sky ×{:.0f} over read noise  ·  {}".format(
+                ratio, verdict)
         else:
-            txt = "Sky {:.0f}%  ·  bright: lower ISO".format(pct)
-        self._hud_info["br"] = txt
+            try:
+                g = (cv2.cvtColor(img[::4, ::4], cv2.COLOR_BGR2GRAY)
+                     if img.ndim == 3 else img[::4, ::4])
+                pct = 100.0 * float(np.median(g)) / 255.0
+            except Exception:           # noqa: BLE001
+                return
+            self._hud_info["br"] = "Sky {:.0f}% of the preview histogram".format(pct)
         self.view.set_hud_info(dict(self._hud_info))
 
     @Slot(object, str)
@@ -12546,7 +12838,10 @@ class MainWindow(QtWidgets.QMainWindow):
         # detail the 24 MP stack holds (~5 s per render instead of ~1 s, off-thread).
         # Otherwise the screen size is all that is ever shown.
         full = self.chk_stack_full.isChecked()
-        self._obs_start((src, flat, self._sat(), 100000 if full else 2400))
+        hide = bool(getattr(self, "chk_starless", None) and self.chk_starless.isChecked())
+        # StarNet takes about ten seconds, so never at full resolution on every frame
+        self._obs_start((src, flat, self._sat(),
+                         1600 if hide else (100000 if full else 2400), hide))
 
     def _obs_start(self, job):
         if getattr(self, "_obs_worker", None) is not None and self._obs_worker.isRunning():
