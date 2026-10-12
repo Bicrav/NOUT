@@ -1508,9 +1508,19 @@ def reveal_faint(f, strength=1.0):
     rl = resid.mean(axis=2)
     rn = 1.4826 * float(np.median(np.abs(rl - np.median(rl)))) + 1e-9
     keep = np.clip((rl - 2.5 * rn) / (2.5 * rn), 0.0, 1.0)[..., None]
-    # a few pixels at the size the picture is shown, so it does not depend on the stack
+    # A few pixels at the size the picture is shown. But applying it everywhere softens
+    # whatever is already strong: on M31 at full resolution it comes to nearly nine
+    # pixels and the dust lanes go with it — reported, and right. Averaging is only
+    # worth its cost where the signal is under the noise, so it is blended in by how
+    # much signal there is: full smoothing on the faint outskirts, none at all on a
+    # galaxy's disc or a nebula's core.
     sigma = max(1.0, 0.0029 * max(f.shape[:2]) * float(strength))
-    return cv2.GaussianBlur(base, (0, 0), sigma) + resid * keep
+    smooth = cv2.GaussianBlur(base, (0, 0), sigma)
+    bl = base.mean(axis=2)
+    noise = 1.4826 * float(np.median(np.abs(bl - cv2.GaussianBlur(bl, (0, 0), 2.0)))) + 1e-9
+    snr = cv2.GaussianBlur(np.abs(bl), (0, 0), sigma) / noise
+    w = np.clip((snr - 2.0) / 6.0, 0.0, 1.0)[..., None]     # 1 = keep it as it is
+    return base * w + smooth * (1 - w) + resid * keep
 
 
 def lift_nebulosity(img8, target_sd=15.0, target_median=64.0):
@@ -1634,7 +1644,18 @@ def render_observation(f, flattened=None, saturation=1.05, max_side=2400,
         f = f * np.clip(means.mean() / (means + 1e-6), 0.8, 1.25)
         lum = f.mean(axis=2)
     # SCNR (average neutral), as Siril does for colour cameras: nothing in the deep sky
-    # is truly green, so green above the red/blue average is the sensor's, not the sky's
+    # is truly green, so green above the red/blue average is the sensor's, not the sky's.
+    #
+    # It does bias the faint outskirts magenta — measured in the halo of two objects, it
+    # cuts green on half the pixels for a green excess that averages zero, so it is
+    # eating noise one-sidedly. Three ways round it were tried and all three were
+    # reverted: removing only a smoothed, significant excess; blending that with the
+    # plain rule by signal strength; and capping the smooth component while passing the
+    # detail through untouched. Measured on a FIXED patch of M31 — brightness-selected
+    # patches move between renders and made the first measurements of this worthless —
+    # each cost about half the colour of the galaxy's disc and left the halo where it
+    # was. The plain rule stays until something is measurably better, not differently
+    # wrong.
     f[..., 1] = np.minimum(f[..., 1], 0.5 * (f[..., 0] + f[..., 2]) +
                            0.02 * np.abs(f[..., 1]))
     # Before stretching: give the faint extended signal a chance of being above the
