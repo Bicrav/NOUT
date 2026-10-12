@@ -1507,7 +1507,7 @@ def reveal_faint(f, strength=1.0):
     resid = f - base
     rl = resid.mean(axis=2)
     rn = 1.4826 * float(np.median(np.abs(rl - np.median(rl)))) + 1e-9
-    keep = np.clip((rl - 2.5 * rn) / (2.5 * rn), 0.0, 1.0)[..., None]
+    keep = np.clip((rl - 2.5 * rn) / (2.5 * rn), 0.0, 1.0)
     # A few pixels at the size the picture is shown. But applying it everywhere softens
     # whatever is already strong: on M31 at full resolution it comes to nearly nine
     # pixels and the dust lanes go with it — reported, and right. Averaging is only
@@ -1519,8 +1519,19 @@ def reveal_faint(f, strength=1.0):
     bl = base.mean(axis=2)
     noise = 1.4826 * float(np.median(np.abs(bl - cv2.GaussianBlur(bl, (0, 0), 2.0)))) + 1e-9
     snr = cv2.GaussianBlur(np.abs(bl), (0, 0), sigma) / noise
-    w = np.clip((snr - 2.0) / 6.0, 0.0, 1.0)[..., None]     # 1 = keep it as it is
-    return base * w + smooth * (1 - w) + resid * keep
+    w = np.clip((snr - 2.0) / 6.0, 0.0, 1.0)                # 1 = keep it as it is
+    # The 2.5-sigma gate above was written to separate stars from noise, and on faint
+    # sky that is what it does. Inside an object it is wrong: measured on M31 it threw
+    # away the detail on 95 % of the galaxy, which is every bit of mottling and fine
+    # dust structure the subs hold — reported as the render being too smooth, and right.
+    # The SNR map already says where there is real signal, so let the detail through
+    # there. Not all of it: at 70 % the four measured scales land within 2 % of the
+    # user's own Siril result on M31 (they were 9 % under), the faint target keeps its
+    # contrast (23.5 to 23.3 levels on 148 subs of the Elephant's Trunk) and the grain
+    # stays where it was.
+    keep = np.maximum(keep, 0.70 * w)
+    w = w[..., None]
+    return base * w + smooth * (1 - w) + resid * keep[..., None]
 
 
 def lift_nebulosity(img8, target_sd=15.0, target_median=64.0):
@@ -5488,7 +5499,7 @@ class ObsRenderWorker(QtCore.QThread):
     """Renders the Observation look off the GUI thread (denoising takes ~0.5 s)."""
     done = Signal(object)
 
-    def __init__(self, src, flat, saturation, max_side=2400, hide_stars=False):
+    def __init__(self, src, flat, saturation, max_side=3200, hide_stars=False):
         super().__init__()
         self.src, self.flat, self.sat, self.max_side = src, flat, saturation, max_side
         self.hide_stars = bool(hide_stars)
@@ -13037,8 +13048,11 @@ class MainWindow(QtWidgets.QMainWindow):
         full = self.chk_stack_full.isChecked()
         hide = bool(getattr(self, "chk_starless", None) and self.chk_starless.isChecked())
         # StarNet takes about ten seconds, so never at full resolution on every frame
+        # 3200, not 2400: a half-size 24 MP stack is 3012 px wide, so this keeps every
+        # pixel it holds instead of throwing a quarter of them away. Costs 1.6 s a
+        # render instead of 1.1 s, off-thread, and anything larger is still bounded.
         self._obs_start((src, flat, self._sat(),
-                         1600 if hide else (100000 if full else 2400), hide))
+                         1600 if hide else (100000 if full else 3200), hide))
 
     def _obs_start(self, job):
         if getattr(self, "_obs_worker", None) is not None and self._obs_worker.isRunning():
