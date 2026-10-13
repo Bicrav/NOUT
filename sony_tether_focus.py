@@ -1621,7 +1621,7 @@ def render_nebulosity(f, saturation=1.05, target_sd=15.0, target_median=64.0):
 
 
 def render_observation(f, flattened=None, saturation=1.05, max_side=2400,
-                      hide_stars=False):
+                      hide_stars=False, smooth=0.6):
     """Smart-telescope look for the live stack: flat neutral sky, colour-true stars,
     galaxy cores that do not burn out, clean background — made to be shown.
 
@@ -1673,12 +1673,18 @@ def render_observation(f, flattened=None, saturation=1.05, max_side=2400,
     # noise at all, or no curve downstream can bring it out.
     if hide_stars:
         shown = render_observation(f, flattened=flattened, saturation=saturation,
-                                   max_side=max_side)
+                                   max_side=max_side, smooth=smooth)
         sn = starnet_starless(shown)
         if sn is not None:
             return lift_nebulosity(sn)
         return render_nebulosity(f, saturation=saturation)
-    f = reveal_faint(f)
+    # How hard to average the parts that are under the noise. Measured on three
+    # stacks: going from 1.0 to 0.35 gains 17 % of the mid-scale detail on the Veil
+    # with its contrast unchanged (4.04 to 4.07 levels), and the same on M31, but
+    # costs 13 % of the contrast on the faintest target there is — 148 subs of the
+    # Elephant's Trunk, 10.4 levels down to 9.0. There is no single right answer, so
+    # it is a setting; 0.6 keeps most of the sharpness for a twentieth of the loss.
+    f = reveal_faint(f, strength=smooth)
     lum = f.mean(axis=2)
     # colour-preserving arcsinh stretch on luminance
     noise = 1.4826 * float(np.median(np.abs(lum[::3, ::3] - np.median(lum[::3, ::3])))) + 1e-6
@@ -2717,6 +2723,7 @@ class SkyWatcherMount:
         self.ip = ip; self.port = port
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         self.sock.settimeout(timeout)
+        self.timeout = float(timeout)
         self.cpr = None; self.freq = None
         self.two_axis = two_axis          # HEQ-5 Pro etc.: also drive the Dec axis (axis 2)
         self.cpr2 = None; self.freq2 = None
@@ -2740,6 +2747,37 @@ class SkyWatcherMount:
     #: replies. Shared across instances: there is one mount.
     _LOCK = threading.RLock()
 
+    #: How long one attempt waits for an inquiry. The mount is its own access point
+    #: and answers in a few milliseconds, so this is already a hundred times the real
+    #: round trip; waiting the full socket timeout instead meant a single lost packet
+    #: froze the caller for two seconds, and the probe runs every couple of seconds.
+    _READ_WAIT = 0.4
+
+    def _drain(self):
+        """Throw away anything still sitting in the socket.
+
+        UDP, and this protocol has no sequence numbers: a reply that turns up after we
+        gave up waiting for it stays in the buffer, and the NEXT command collects it as
+        though it were its own answer. That is how a step counter comes back seconds
+        old — which reads exactly like an axis falling behind its rate — and how a
+        status byte ends up answering a question nobody asked. Anything already waiting
+        here belongs to an exchange that is over, so it goes."""
+        old = self.sock.gettimeout()
+        dropped = 0
+        try:
+            self.sock.settimeout(0)
+            while True:
+                try:
+                    self.sock.recvfrom(256)
+                    dropped += 1
+                except Exception:                       # noqa: BLE001  (nothing left)
+                    break
+        finally:
+            self.sock.settimeout(old)
+        if dropped:
+            self._log("SW drained {} stale repl{}".format(dropped, "y" if dropped == 1 else "ies"))
+        return dropped
+
     def _send(self, body, retries=None):
         """Send one command over UDP, retrying reads.
 
@@ -2747,14 +2785,24 @@ class SkyWatcherMount:
         used to abort the wait, which let the caller stop the motor half way
         through a GoTo and call it finished."""
         msg = (":" + body + "\r").encode("ascii")
+        read = body[:1] in self._READ_CMDS
         if retries is None:
-            retries = 5 if body[:1] in self._READ_CMDS else 0
+            retries = 5 if read else 0
         last = None
         for _ in range(retries + 1):
             try:
                 with self._LOCK:
-                    self.sock.sendto(msg, (self.ip, self.port))
-                    data, _ = self.sock.recvfrom(256)
+                    self._drain()               # never answer this with the last one
+                    base = self.sock.gettimeout()
+                    wait = min(base, self._READ_WAIT) if read and base else base
+                    try:
+                        if wait != base:
+                            self.sock.settimeout(wait)
+                        self.sock.sendto(msg, (self.ip, self.port))
+                        data, _ = self.sock.recvfrom(256)
+                    finally:
+                        if wait != base:
+                            self.sock.settimeout(base)
                 resp = data.decode("ascii", "ignore").strip()
                 self._log("SW >{}  <{}".format(body, resp))
                 if resp.startswith("!"):
@@ -3098,7 +3146,7 @@ class SkyWatcherMount:
         except Exception:               # noqa: BLE001
             pass
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        self.sock.settimeout(2.0)
+        self.sock.settimeout(getattr(self, "timeout", 2.0))   # as the link was opened
         self.cpr = None; self.freq = None
         return self.connect(preserve_position=True)     # keep the count: see connect()
 
@@ -5567,16 +5615,18 @@ class ObsRenderWorker(QtCore.QThread):
     """Renders the Observation look off the GUI thread (denoising takes ~0.5 s)."""
     done = Signal(object)
 
-    def __init__(self, src, flat, saturation, max_side=3200, hide_stars=False):
+    def __init__(self, src, flat, saturation, max_side=3200, hide_stars=False, smooth=0.6):
         super().__init__()
         self.src, self.flat, self.sat, self.max_side = src, flat, saturation, max_side
         self.hide_stars = bool(hide_stars)
+        self.smooth = float(smooth)
 
     def run(self):
         try:
             self.done.emit(render_observation(self.src, self.flat, saturation=self.sat,
                                               max_side=self.max_side,
-                                              hide_stars=self.hide_stars))
+                                              hide_stars=self.hide_stars,
+                                              smooth=self.smooth))
         except Exception as e:          # noqa: BLE001
             print("[NOUT] observation render failed:", e, file=sys.stderr, flush=True)
             self.done.emit(None)
@@ -9770,6 +9820,24 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sat_slider.valueChanged.connect(self._restretch)
         srow.addWidget(QtWidgets.QLabel("saturation")); srow.addWidget(self.sat_slider)
         rl.addLayout(srow)
+        drow = QtWidgets.QHBoxLayout()
+        drow.addWidget(QtWidgets.QLabel("detail"))
+        self.obs_smooth = QtWidgets.QComboBox()
+        for lab, val in (("Sharp", 0.35), ("Balanced", 0.60), ("Smooth (faintest)", 1.00)):
+            self.obs_smooth.addItem(lab, val)
+        self.obs_smooth.setToolTip(
+            "How hard the live stack is averaged where the signal is under the noise.\n"
+            "Sharp: finest detail \u2014 on the Veil it holds 17 % more mid-scale "
+            "structure for the same nebula contrast.\n"
+            "Smooth: what NOUT did before \u2014 the most contrast on a very faint "
+            "target (13 % more on 148 subs of the Elephant's Trunk), at the cost of "
+            "looking soft.")
+        self.obs_smooth.setCurrentIndex(
+            max(0, self.obs_smooth.findText(
+                QtCore.QSettings("NOUT", "NOUT").value("obs_smooth", "Balanced", type=str))))
+        self.obs_smooth.currentIndexChanged.connect(self._on_smooth_change)
+        drow.addWidget(self.obs_smooth); drow.addStretch(1)
+        rl.addLayout(drow)
         self.chk_cull = QtWidgets.QCheckBox("Discard bad exposures (→ rejected/)")
         self.chk_cull.setToolTip("Moves to rejected/ the shots where star count drops.")
         self.chk_cull.toggled.connect(lambda on: self.worker.post("set_cull", on=on))
@@ -10885,6 +10953,17 @@ class MainWindow(QtWidgets.QMainWindow):
 
     def _sat(self):
         return self.sat_slider.value() / 100.0 if hasattr(self, "sat_slider") else 1.0
+
+    def _smooth(self):
+        w = getattr(self, "obs_smooth", None)
+        return float(w.currentData()) if w is not None else 0.6
+
+    def _on_smooth_change(self, *args):
+        QtCore.QSettings("NOUT", "NOUT").setValue("obs_smooth", self.obs_smooth.currentText())
+        self._restretch()
+        src = getattr(self, "_last_stack_src", None)
+        if src is not None:
+            self._obs_request(src, getattr(self, "_last_stack_flat", None))
 
     def _disp_result(self, img, processed=False):
         """Display image for a Results entry. Stacks already flattened+stretched from
@@ -13450,8 +13529,10 @@ class MainWindow(QtWidgets.QMainWindow):
         # 3200, not 2400: a half-size 24 MP stack is 3012 px wide, so this keeps every
         # pixel it holds instead of throwing a quarter of them away. Costs 1.6 s a
         # render instead of 1.1 s, off-thread, and anything larger is still bounded.
+        self._last_stack_src, self._last_stack_flat = src, flat
         self._obs_start((src, flat, self._sat(),
-                         1600 if hide else (100000 if full else 3200), hide))
+                         1600 if hide else (100000 if full else 3200), hide,
+                         self._smooth()))
 
     def _obs_start(self, job):
         if getattr(self, "_obs_worker", None) is not None and self._obs_worker.isRunning():
@@ -15488,6 +15569,20 @@ class MainWindow(QtWidgets.QMainWindow):
         import manual_goto
         from datetime import datetime
         if not cpr or measured != measured:             # NaN: nothing to read
+            # One lost UDP reply is not a disconnection. This is Wi-Fi to a battery
+            # powered board, packets go missing, and every single one of them used to
+            # turn the indicator to "Mount not connected" — which is most of what made
+            # the link look as unstable as it did. Hold the last real verdict for as
+            # long as the probe is allowed to be quiet before the link is re-opened
+            # anyway (six failures, about twelve seconds), and only then say it is off.
+            # Not conditioned on cpr: a probe that failed reports cpr = 0 precisely
+            # because it could not read anything, which is the case this is for. The
+            # fifteen seconds are the guard — a mount that is really gone says so then.
+            last = getattr(self, "_track_last_good", None)
+            if last and time.monotonic() - last[0] < 15.0:
+                col, short, head, detail = last[1]
+                return (col, short, head, detail + ".  No reading came back just now; "
+                        "showing the last one.")
             self._track_state_kind = "off"
             return ("#94a3b8", "⚪  mount off",
                     "⚪  Mount not connected",
@@ -15504,8 +15599,9 @@ class MainWindow(QtWidgets.QMainWindow):
         want = self._rate_mode_name(body)
         if abs(ratio) > 3.0:
             self._track_state_kind = "slew"
-            return ("#38bdf8", "⏩  slewing", "⏩  Slewing — not tracking right now",
-                    "{:.0f}× sidereal".format(abs(ratio)))
+            return self._remember_verdict(
+                ("#38bdf8", "⏩  slewing", "⏩  Slewing — not tracking right now",
+                 "{:.0f}× sidereal".format(abs(ratio))))
         if abs(ratio) < 0.25:
             self._track_state_kind = "stopped"
             return ("#f87171", "⏸  STOPPED — click to start",
@@ -15536,16 +15632,23 @@ class MainWindow(QtWidgets.QMainWindow):
                     detail + ".  Click the indicator to apply the {} rate.".format(want))
         if slipping:
             self._track_state_kind = "slip"
-            return ("#fbbf24", "⚠  axis behind its rate",
-                    "⚠  The axis is not holding the rate it was given",
-                    detail + ".  The rate itself is right, so look at the mechanics: "
-                    "a clutch not tight, the counterweight badly out of balance, or "
-                    "the battery running low.")
+            return self._remember_verdict(
+                ("#fbbf24", "⚠  axis behind its rate",
+                 "⚠  The axis is not holding the rate it was given",
+                 detail + ".  The rate itself is right, so look at the mechanics: "
+                 "a clutch not tight, the counterweight badly out of balance, or "
+                 "the battery running low."))
         self._track_state_kind = "ok"
-        return ("#4ade80", "🟢  {}".format(want),
-                "🟢  Tracking — {} rate, {}".format(
-                    want, "as your target needs" if body != "sidereal"
-                    else "as the stars need"), detail)
+        return self._remember_verdict(
+            ("#4ade80", "🟢  {}".format(want),
+             "🟢  Tracking — {} rate, {}".format(
+                 want, "as your target needs" if body != "sidereal"
+                 else "as the stars need"), detail))
+
+    def _remember_verdict(self, verdict):
+        """Keep the last real reading, so a lost UDP reply does not erase it."""
+        self._track_last_good = (time.monotonic(), verdict)
+        return verdict
 
     def _on_track_state(self, measured, commanded, cpr, sigma=0.0):
         col, short, head, detail = self._track_verdict(measured, commanded, cpr, sigma)
@@ -16173,8 +16276,21 @@ class MainWindow(QtWidgets.QMainWindow):
         self._track_y.append(hfr)
         self.track_curve.setData(list(self._track_x), list(self._track_y))
         txt = "HFR {:.2f} px  ·  eccentricity {:.2f}  ·  ★{}".format(hfr, ecc, stars)
-        if ecc > 0.6:
-            txt += "   ⚠ elongated stars (tracking?)"
+        # What counts as elongated, measured rather than guessed. On three of this
+        # setup's own sessions — frames with nothing wrong with them — the median
+        # eccentricity sits at 0.51 to 0.60, because the stars are barely sampled at
+        # half size (HFR 2.4 px) and the moments of a handful of pixels are never
+        # round. The old 0.6 therefore fired on perfectly good frames. Smearing one of
+        # those frames by a known amount puts 5 px of trailing at 0.79 and 7 px at
+        # 0.83, so 0.75 is the first value that means something real. It also follows
+        # the session's own floor, since a different focal length or a softer night
+        # moves it.
+        self._ecc_hist = (getattr(self, "_ecc_hist", []) + [float(ecc)])[-40:]
+        floor = float(np.median(self._ecc_hist)) if len(self._ecc_hist) >= 5 else 0.0
+        limit = max(0.75, floor + 0.12)
+        if ecc > limit:
+            txt += "   ⚠ elongated stars — {:.0f}% longer than wide (tracking?)".format(
+                100.0 * ((1.0 - min(ecc, 0.999) ** 2) ** -0.5 - 1.0))
             self.track_info.setStyleSheet("color:#ef4444;")
         else:
             self.track_info.setStyleSheet("color:#94a3b8;")
