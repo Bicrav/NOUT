@@ -3326,18 +3326,86 @@ def save_gallery(d):
         print("[NOUT] gallery not saved:", e, file=sys.stderr, flush=True)
 
 
+_CURATED = None
+
+
+def curated_objects():
+    """Every object NOUT has a common name for, with its coordinates resolved.
+
+    dso_names.csv is the hand-written list of things people actually go after. Most of
+    its rows give only the name and leave the coordinates to the main catalogue, but a
+    few carry their own because they are not in it at all — IC 2118, the Sharpless and
+    Melotte entries, Barnard 33. Both cases are resolved here so that one table can
+    serve the gallery, the search box and the GoTo. Keyed by id, upper case, no spaces.
+    """
+    global _CURATED
+    if _CURATED is not None:
+        return _CURATED
+    here = os.path.dirname(os.path.abspath(__file__))
+    key = lambda s: (s or "").strip().upper().replace(" ", "")
+    pos = {}
+    try:
+        import csv as _csv
+        with open(os.path.join(here, "catalog_ngc.csv"), newline="", encoding="utf-8") as f:
+            for row in _csv.DictReader(f):
+                try:
+                    pos[key(row["id"])] = (float(row["ra_hours"]) * 15.0,
+                                           float(row["dec_deg"]))
+                except (KeyError, ValueError, TypeError):
+                    continue
+    except Exception:                   # noqa: BLE001
+        pass
+    out = {}
+    try:
+        import csv as _csv
+        with open(os.path.join(here, "dso_names.csv"), newline="", encoding="utf-8") as f:
+            for row in _csv.DictReader(f):
+                oid = (row.get("id") or "").strip()
+                if not oid:
+                    continue
+                def _f(k):
+                    try:
+                        return float((row.get(k) or "").strip())
+                    except ValueError:
+                        return None
+                ra, dec = _f("ra_deg"), _f("dec_deg")
+                if ra is None or dec is None:
+                    ra, dec = pos.get(key(oid), (ra, dec))
+                out[key(oid)] = {"id": oid, "name": (row.get("name") or "").strip() or oid,
+                                 "name_fr": (row.get("name_fr") or "").strip(),
+                                 "type": (row.get("type") or "").strip(),
+                                 "ra": ra, "dec": dec}
+    except Exception:                   # noqa: BLE001
+        pass
+    _CURATED = out
+    return out
+
+
 def gallery_slots():
-    """Every slot of the collection: the 110 Messier first, then the named NGC/IC
-    objects NOUT knows a distance for — the ones people actually go after."""
+    """Every slot of the collection: the 110 Messier first, then every named object
+    NOUT knows — the ones people actually go after.
+
+    This used to be driven by dso_info.csv, which is a table of distances; an object
+    only had a slot if someone had looked its distance up. That left 97 named targets
+    out of the collection, the Witch Head among them, and showed the rest as bare
+    catalogue numbers with nothing to search on. The named list is the right source,
+    and the distance table is still folded in so no slot that existed disappears."""
     out = [("M{}".format(i), "Messier") for i in range(1, 111)]
+    seen = {"M{}".format(i) for i in range(1, 111)}
+    def _add(oid):
+        k = (oid or "").strip().upper().replace(" ", "")
+        if not k or k in seen or re.match(r"(?i)^m\d+$", k):
+            return
+        seen.add(k)
+        out.append((oid.strip(), "NGC / IC"))
+    for info in curated_objects().values():
+        _add(info["id"])
     try:
         import csv as _csv
         with open(os.path.join(os.path.dirname(os.path.abspath(__file__)), "dso_info.csv"),
                   newline="", encoding="utf-8") as f:
             for row in _csv.DictReader(f):
-                oid = (row.get("id") or "").strip()
-                if oid and not re.match(r"(?i)^m\d+$", oid):
-                    out.append((oid, "NGC / IC"))
+                _add(row.get("id") or "")
     except Exception:                   # noqa: BLE001
         pass
     return out
@@ -10053,9 +10121,20 @@ class MainWindow(QtWidgets.QMainWindow):
         bar.addWidget(self.gal_count)
         bar.addSpacing(16)
         f = QtWidgets.QLabel("Show"); f.setObjectName("cap"); bar.addWidget(f)
+        # Two filters rather than one: the old single list mixed "what I have" with
+        # "which catalogue", so you could not ask for the Messier you have shot. The
+        # sheet is 267 slots now, and most of them are empty until you get to them.
+        self.gal_status = QtWidgets.QComboBox()
+        for lab, key in (("Everything", "all"), ("Only my photos", "done"),
+                         ("Only what is missing", "todo")):
+            self.gal_status.addItem(lab, key)
+        self.gal_status.setToolTip("Hides the empty slots, so the sheet shows only "
+                                   "what you have photographed.")
+        self.gal_status.activated.connect(lambda *_: self._refresh_gallery())
+        bar.addWidget(self.gal_status)
         self.gal_filter = QtWidgets.QComboBox()
-        for lab, key in (("Everything", "all"), ("Captured", "done"), ("Still missing", "todo"),
-                         ("Messier", "messier"), ("NGC / IC", "ngc")):
+        for lab, key in (("All catalogues", "all"), ("Messier", "messier"),
+                         ("NGC / IC", "ngc"), ("Added by me", "mine")):
             self.gal_filter.addItem(lab, key)
         self.gal_filter.activated.connect(lambda *_: self._refresh_gallery())
         bar.addWidget(self.gal_filter)
@@ -10063,6 +10142,11 @@ class MainWindow(QtWidgets.QMainWindow):
         self.gal_search.setPlaceholderText("Find an object…")
         self.gal_search.textChanged.connect(lambda *_: self._refresh_gallery())
         bar.addWidget(self.gal_search, 1)
+        newb = QtWidgets.QPushButton("＋ Object…")
+        newb.setToolTip("Adds a slot for something that is not in the sheet — "
+                        "a comet, a Sharpless nebula, anything you like.")
+        newb.clicked.connect(self._gallery_new_object)
+        bar.addWidget(newb)
         addb = QtWidgets.QPushButton("＋ Add a photo…")
         addb.setObjectName("primary")
         addb.clicked.connect(lambda: self._gallery_add())
@@ -10076,7 +10160,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.gal_list = QtWidgets.QListWidget()
         self.gal_list.setViewMode(QtWidgets.QListView.ViewMode.IconMode)
         self.gal_list.setIconSize(QtCore.QSize(180, 180))
-        self.gal_list.setGridSize(QtCore.QSize(200, 214))
+        # Room for two lines under the picture: every slot carries its common name
+        # now, and at 214 the second line ran into the row below.
+        self.gal_list.setGridSize(QtCore.QSize(200, 236))
         self.gal_list.setResizeMode(QtWidgets.QListView.ResizeMode.Adjust)
         self.gal_list.setMovement(QtWidgets.QListView.Movement.Static)
         self.gal_list.setSpacing(6)
@@ -10112,39 +10198,46 @@ class MainWindow(QtWidgets.QMainWindow):
         gal = load_gallery()
         self.gal_list.clear()
         want = self.gal_filter.currentData()
+        status = self.gal_status.currentData()
         needle = self.gal_search.text().strip().lower()
-        names = {}
+        # Common names, so that "witch" finds IC 2118. The map catalogue alone was not
+        # enough: it is keyed on the NGC numbers, and several named objects are not in
+        # it under the id the gallery uses.
+        names = {k: (v.get("name") or "") for k, v in curated_objects().items()}
         try:
             for o in getattr(self.skymap, "dso", []) or []:
-                names[str(o.get("id", "")).upper()] = o.get("name") or ""
+                names.setdefault(str(o.get("id", "")).upper(), o.get("name") or "")
         except Exception:               # noqa: BLE001
             pass
         slots = gallery_slots()
-        known = {k for k, _ in slots}
-        slots += [(k, "Other") for k in gal if k not in known]        # anything you added
-        nm_done = ngc_done = 0
+        known = {k.upper() for k, _ in slots}
+        slots += [(k, "Other") for k in gal if k.upper() not in known]  # anything you added
+        nm_done = ngc_done = shot = 0
         for oid, kind in slots:
-            entry = gal.get(oid)
-            done = bool(entry)
+            entry = gal.get(oid) or {}
+            done = bool(entry.get("file"))      # a slot you added by hand is not a photo
             if done:
+                shot += 1
                 if kind == "Messier":
                     nm_done += 1
                 elif kind == "NGC / IC":
                     ngc_done += 1
-            if want == "done" and not done:
+            if status == "done" and not done:
                 continue
-            if want == "todo" and done:
+            if status == "todo" and done:
                 continue
             if want == "messier" and kind != "Messier":
                 continue
             if want == "ngc" and kind != "NGC / IC":
                 continue
-            label = names.get(oid.upper(), "")
+            if want == "mine" and kind != "Other":
+                continue
+            label = entry.get("name") or names.get(oid.upper(), "")
             if needle and needle not in oid.lower() and needle not in label.lower():
                 continue
             text = oid if not label else "{}\n{}".format(oid, label)
             it = QtWidgets.QListWidgetItem(self._gallery_thumb(
-                (entry or {}).get("file"), done), text)
+                entry.get("file"), done), text)
             it.setData(Qt.UserRole, oid)
             it.setTextAlignment(Qt.AlignHCenter | Qt.AlignTop)
             if not done:
@@ -10160,7 +10253,157 @@ class MainWindow(QtWidgets.QMainWindow):
                 it.setToolTip("  ·  ".join(tip))
             self.gal_list.addItem(it)
         self.gal_count.setText("Messier {}/110   ·   NGC / IC {}   ·   {} in the collection"
-                               .format(nm_done, ngc_done, len(gal)))
+                               .format(nm_done, ngc_done, shot))
+
+    def _gallery_reveal(self, oid):
+        """Show a slot whatever the filters happen to be set to, and select it.
+
+        Adding something while "only my photos" is on would otherwise put it straight
+        behind the filter, and it would look as though nothing had happened."""
+        self.gal_status.setCurrentIndex(0)
+        self.gal_filter.setCurrentIndex(0)
+        self.gal_search.blockSignals(True)
+        self.gal_search.setText("")
+        self.gal_search.blockSignals(False)
+        self._refresh_gallery()
+        for i in range(self.gal_list.count()):
+            it = self.gal_list.item(i)
+            if (it.data(Qt.UserRole) or "").upper() == (oid or "").upper():
+                self.gal_list.setCurrentItem(it)
+                self.gal_list.scrollToItem(
+                    it, QtWidgets.QAbstractItemView.ScrollHint.PositionAtCenter)
+                return
+
+    @staticmethod
+    def _parse_angle(text, hours=False):
+        """"20 12 30", "20:12:30", "20h12m30s" or plain degrees. None if it is not one."""
+        t = (text or "").strip().lower().replace("\u00b0", " ").replace("'", " ")
+        if not t:
+            return None
+        for ch in "hmsd:,":
+            t = t.replace(ch, " ")
+        parts = [q for q in t.split() if q]
+        try:
+            vals = [float(q) for q in parts]
+        except ValueError:
+            return None
+        if not vals:
+            return None
+        sign = -1.0 if (parts[0].startswith("-") or vals[0] < 0) else 1.0
+        v = abs(vals[0]) + (vals[1] / 60.0 if len(vals) > 1 else 0.0) \
+            + (vals[2] / 3600.0 if len(vals) > 2 else 0.0)
+        v *= sign
+        if not hours:
+            return v
+        # "05h 04m 54s" is hours; a bare number is whatever it can only be. Right
+        # ascension runs 0 to 24 in hours, so anything above that was already degrees
+        # — which is how most pages print it, and pasting one in should not silently
+        # multiply it by fifteen.
+        return v * 15.0 if (len(vals) > 1 or abs(v) <= 24.0) else v
+
+    def _gallery_new_object(self):
+        """Add a slot for something the sheet does not have.
+
+        Most of the time the object IS known and only its slot is missing, so the box
+        completes on every name NOUT knows and fills the coordinates in by itself. The
+        coordinates are only asked for when nothing matches — a new comet, a Sharpless
+        number, a patch of sky you want to keep a picture of."""
+        dlg = QtWidgets.QDialog(self); dlg.setWindowTitle("Add an object")
+        v = QtWidgets.QVBoxLayout(dlg)
+        v.addWidget(QtWidgets.QLabel("Which object? A name or a catalogue number."))
+        ed = QtWidgets.QLineEdit()
+        ed.setPlaceholderText("Witch Head, IC2118, Sh2-155, C/2023 A3\u2026")
+        cur = curated_objects()
+        words = sorted({w for info in cur.values()
+                        for w in (info["id"], info.get("name") or "") if w})
+        try:
+            self._ensure_search_index()
+            words = sorted(set(words) | {oid for oid, _n, _r, _d in self._search_index})
+        except Exception:               # noqa: BLE001
+            pass
+        comp = QtWidgets.QCompleter(words, dlg)
+        comp.setCaseSensitivity(Qt.CaseInsensitive)
+        comp.setFilterMode(Qt.MatchContains)
+        ed.setCompleter(comp)
+        v.addWidget(ed)
+        hint = QtWidgets.QLabel(""); hint.setObjectName("cap"); v.addWidget(hint)
+        box = QtWidgets.QWidget(); g = QtWidgets.QGridLayout(box)
+        g.setContentsMargins(0, 0, 0, 0)
+        ra_e, dec_e = QtWidgets.QLineEdit(), QtWidgets.QLineEdit()
+        ra_e.setPlaceholderText("05h 04m 54s"); dec_e.setPlaceholderText("-07\u00b0 14\u2032")
+        g.addWidget(QtWidgets.QLabel("RA (h m s)"), 0, 0); g.addWidget(ra_e, 0, 1)
+        g.addWidget(QtWidgets.QLabel("Dec (\u00b0 \u2032 \u2033)"), 1, 0); g.addWidget(dec_e, 1, 1)
+        v.addWidget(box); box.setVisible(False)
+
+        def look_up():
+            q = ed.text().strip()
+            if not q:
+                hint.setText(""); box.setVisible(False); return None
+            nq = self._norm_id(q); ql = q.lower()
+            for info in cur.values():
+                if self._norm_id(info["id"]) == nq or (info.get("name") or "").lower() == ql:
+                    return info
+            try:
+                for oid, name, ra, dec in self._search_index:
+                    if self._norm_id(oid) == nq or (name or "").lower() == ql:
+                        return {"id": oid, "name": name or oid, "ra": ra, "dec": dec}
+            except Exception:           # noqa: BLE001
+                pass
+            return None
+
+        def on_edit():
+            info = look_up()
+            if info:
+                hint.setText("{} \u2014 NOUT knows this one, its position comes with it."
+                             .format(info.get("name") or info["id"]))
+                box.setVisible(False)
+            else:
+                hint.setText("Not in the catalogue. Give its position if you want to "
+                             "point at it later \u2014 leave it empty for a slot only.")
+                box.setVisible(True)
+        ed.textChanged.connect(lambda *_: on_edit())
+        row = QtWidgets.QHBoxLayout()
+        cancel = QtWidgets.QPushButton("Cancel"); cancel.clicked.connect(dlg.reject)
+        ok = QtWidgets.QPushButton("Add"); ok.setObjectName("primary")
+        ok.setDefault(True); ok.clicked.connect(dlg.accept)
+        row.addStretch(1); row.addWidget(cancel); row.addWidget(ok)
+        v.addLayout(row)
+        if dlg.exec() != QtWidgets.QDialog.DialogCode.Accepted:
+            return
+        typed = ed.text().strip()
+        if not typed:
+            return
+        info = look_up()
+        if info:
+            oid, name = info["id"], info.get("name") or info["id"]
+            ra, dec = info.get("ra"), info.get("dec")
+        else:
+            # A catalogue number is squashed the way the rest of the sheet writes them
+            # (NGC 7000 -> NGC7000), but anything else is a name and keeps its spaces:
+            # "Barnard's Loop" must not become BARNARD'SLOOP on the card.
+            compact = re.sub(r"\s+", "", typed).upper()
+            oid = compact if re.fullmatch(r"[A-Z]{1,6}\d*[-+]?\d+[A-Z]?", compact) \
+                else re.sub(r"\s+", " ", typed).strip()
+            name = typed
+            ra = self._parse_angle(ra_e.text(), hours=True)
+            dec = self._parse_angle(dec_e.text())
+        key = oid.upper().replace(" ", "")
+        if any(k.upper().replace(" ", "") == key for k, _ in gallery_slots()):
+            self._gallery_reveal(oid)
+            self.statusBar().showMessage(
+                "{} is already in the sheet \u2014 here it is.".format(oid), 6000)
+            return
+        gal = load_gallery()
+        entry = dict(gal.get(oid) or {})
+        entry.update({"name": name, "added": datetime.now().strftime("%Y-%m-%d")})
+        if ra is not None and dec is not None:
+            entry["ra"], entry["dec"] = float(ra), float(dec)
+        gal[oid] = entry
+        save_gallery(gal)
+        self._search_index = None       # so the new object can be searched for at once
+        self._gallery_reveal(oid)
+        self.statusBar().showMessage(
+            "{} added to the sheet. Double-click it to put a photo in.".format(oid), 7000)
 
     def _gallery_add(self, oid=None, src=None, frames=None, integ=None):
         """Put a picture in the collection: pick the object, then the file."""
@@ -10183,7 +10426,10 @@ class MainWindow(QtWidgets.QMainWindow):
         if img.isNull():
             self.statusBar().showMessage("That file is not an image NOUT can read.", 6000)
             return
-        dest = os.path.join(gallery_dir(), "{}.jpg".format(oid))
+        # The id can be a name you typed yourself, so it is not a file name until the
+        # characters a file name cannot hold are taken out of it.
+        safe = re.sub(r"[^\w.\- ]+", "_", oid).strip() or "object"
+        dest = os.path.join(gallery_dir(), "{}.jpg".format(safe))
         if img.width() > 2400:
             img = img.scaledToWidth(2400, Qt.SmoothTransformation)
         img.save(dest, "JPG", 92)
@@ -11866,6 +12112,25 @@ class MainWindow(QtWidgets.QMainWindow):
             if getattr(self, "skymap", None):
                 for d in self.skymap.dso:
                     self._search_index.append((d["id"], d.get("name", ""), d["ra"], d["dec"]))
+        # The named list and anything added by hand, for the ones the main catalogue
+        # does not carry: the Witch Head is IC 2118 everywhere except there, where it
+        # is NGC 1909, so searching for it found nothing. Same for the Sharpless and
+        # Melotte entries. Names already present are left alone.
+        have = {self._norm_id(oid) for oid, _n, _r, _d in self._search_index}
+        extra = dict(curated_objects())
+        for oid, entry in (load_gallery() or {}).items():
+            if entry.get("ra") is not None and entry.get("dec") is not None:
+                extra[oid.upper().replace(" ", "")] = {
+                    "id": oid, "name": entry.get("name") or oid,
+                    "ra": entry["ra"], "dec": entry["dec"]}
+        for info in extra.values():
+            if info.get("ra") is None or info.get("dec") is None:
+                continue
+            if self._norm_id(info["id"]) in have:
+                continue
+            have.add(self._norm_id(info["id"]))
+            self._search_index.append((info["id"], info.get("name") or info["id"],
+                                       float(info["ra"]), float(info["dec"])))
 
     @staticmethod
     def _norm_id(s):
