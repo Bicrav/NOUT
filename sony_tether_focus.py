@@ -6626,19 +6626,73 @@ class SolveWorker(QtCore.QThread):
         return json.loads(urllib.request.urlopen(req, timeout=180).read().decode())
 
 
-def _sky_cache_dir():
-    d = os.path.join(os.path.expanduser("~"), ".nout", "sky_cache")
+_SKY_CACHE = None                 # (directory written to, directories read from)
+_SKY_CACHE_WARNED = False
+
+
+def _dir_writable(d):
     try:
         os.makedirs(d, exist_ok=True)
+        probe = os.path.join(d, ".nout_write_test")
+        with open(probe, "wb") as f:
+            f.write(b"x")
+        os.remove(probe)
+        return True
     except Exception:                 # noqa: BLE001
-        pass
-    return d
+        return False
+
+
+def _sky_cache_dirs():
+    """Where cached sky tiles live: one directory to write to, and any older one still
+    worth reading from.
+
+    ~/.nout/sky_cache ended up owned by root on this machine — running the app once as
+    administrator is enough to do it — and every write after that failed inside a bare
+    except that said nothing. Nothing had been cached since June: every background tile
+    and every panel image was fetched from Strasbourg again on every single view, which
+    is most of why they felt so slow. The old directory is still perfectly readable, so
+    it stays in the search path and its 447 MB keep working; new tiles go somewhere we
+    can actually write."""
+    global _SKY_CACHE
+    if _SKY_CACHE is not None:
+        return _SKY_CACHE
+    home = os.path.join(os.path.expanduser("~"), ".nout", "sky_cache")
+    if _dir_writable(home):
+        _SKY_CACHE = (home, [home])
+        return _SKY_CACHE
+    # GenericCacheLocation, not CacheLocation: the latter ends in whatever Qt thinks
+    # the application is called, which is the interpreter's name when NOUT is run from
+    # a script, so the cache would move depending on how it was started.
+    base = QtCore.QStandardPaths.writableLocation(
+        QtCore.QStandardPaths.StandardLocation.GenericCacheLocation) \
+        or os.path.expanduser("~/Library/Caches")
+    alt = os.path.join(base, "NOUT", "sky_cache")
+    reads = [alt] + ([home] if os.path.isdir(home) else [])
+    print("[NOUT] {} is not writable (owner?); caching sky tiles in {} instead"
+          .format(home, alt), file=sys.stderr, flush=True)
+    _SKY_CACHE = (alt if _dir_writable(alt) else "", reads)
+    return _SKY_CACHE
+
+
+def _sky_cache_dir():
+    return _sky_cache_dirs()[0] or os.path.join(os.path.expanduser("~"), ".nout", "sky_cache")
+
+
+def _sky_cache_name(hips, ra, dec, fov, size):
+    import hashlib
+    raw = "{}|{:.3f}|{:.3f}|{:.4f}|{}".format(hips, ra, dec, fov, size)
+    return hashlib.md5(raw.encode()).hexdigest() + ".jpg"
 
 
 def _sky_cache_key(hips, ra, dec, fov, size):
-    import hashlib
-    raw = "{}|{:.3f}|{:.3f}|{:.4f}|{}".format(hips, ra, dec, fov, size)
-    return os.path.join(_sky_cache_dir(), hashlib.md5(raw.encode()).hexdigest() + ".jpg")
+    """An existing cached file if there is one, otherwise where it would be written."""
+    name = _sky_cache_name(hips, ra, dec, fov, size)
+    write_dir, read_dirs = _sky_cache_dirs()
+    for d in read_dirs:
+        p = os.path.join(d, name)
+        if os.path.exists(p):
+            return p
+    return os.path.join(write_dir or read_dirs[0], name)
 
 
 _FOV_LADDER = [0.3, 0.5, 0.8, 1.2, 2.0, 3.0, 5.0, 8.0, 12.0, 20.0, 30.0, 40.0]
@@ -6670,6 +6724,36 @@ def _light_tile_params(ra, dec, fov):
     return round(ra_q, 4), round(dec_q, 4), round(fov * 1.5, 4), _BG_TILE_SIZE
 
 
+# CDS serves hips2fits from several hosts and they are not equally quick, nor the same
+# one quick from one hour to the next. Measured on identical uncached views: alaskybis
+# returned a 768 px tile in 1.3 s while alasky.cds took 8-9 s for a byte-identical
+# image — six times slower, slow enough that the background hit its timeout and never
+# appeared at all. Twenty minutes later the two had swapped places. So no host is
+# hard-coded and none is trusted for long: every fetch is timed, and the next one
+# starts with whichever has been answering fastest.
+_HIPS_HOSTS = ("alasky.cds.unistra.fr", "alaskybis.unistra.fr", "alasky.u-strasbg.fr")
+_HIPS_COST = {}                    # host -> smoothed cost, see _hips_cost
+_HIPS_UNTRIED = 5.0                # worse than a host known to be good (2-4), better
+_HIPS_DEAD = 1e6                   # than one known to be bad (12 and up)
+
+
+def _hips_cost(seconds, mpx):
+    """Seconds, with the part that does not depend on the image size taken out.
+
+    The panel asks for 240 px and the map background for 768, so a plain duration
+    would make every small request look cheap and rank the hosts by what they were
+    last asked for rather than by how fast they are. The 0.12 is the fixed part of a
+    request measured on both hosts at both sizes; what is left scales with the area."""
+    return float(seconds) / (0.12 + max(float(mpx), 0.0))
+
+
+def _hips_order():
+    if _HIPS_COST and all(v >= _HIPS_DEAD for v in _HIPS_COST.values()) \
+            and len(_HIPS_COST) >= len(_HIPS_HOSTS):
+        _HIPS_COST.clear()         # everything failed once (no network?): start over
+    return sorted(_HIPS_HOSTS, key=lambda h: _HIPS_COST.get(h, _HIPS_UNTRIED))
+
+
 def _fetch_and_cache(hips, ra, dec, fov, size, timeout=25):
     """Return jpeg bytes for a hips2fits view, using the on-disk cache (offline-safe)."""
     cache = _sky_cache_key(hips, ra, dec, fov, size)
@@ -6682,18 +6766,43 @@ def _fetch_and_cache(hips, ra, dec, fov, size, timeout=25):
               "fov": "{:.4f}".format(max(fov, 0.02)), "projection": "TAN",
               "coordsys": "icrs", "ra": "{:.5f}".format(ra),
               "dec": "{:.5f}".format(dec), "format": "jpg"}
-    url = ("https://alasky.cds.unistra.fr/hips-image-services/hips2fits?"
-           + urllib.parse.urlencode(params))
-    req = urllib.request.Request(url, headers={"User-Agent": "NOUT/1.0"})
-    with urllib.request.urlopen(req, timeout=timeout) as r:
-        data = r.read()
+    query = urllib.parse.urlencode(params)
+    mpx = max(int(size) * int(size) / 1e6, 1e-3)
+    data = None
+    last = None
+    for host in _hips_order():
+        url = "https://{}/hips-image-services/hips2fits?{}".format(host, query)
+        req = urllib.request.Request(url, headers={"User-Agent": "NOUT/1.0"})
+        t0 = time.monotonic()
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                data = r.read()
+        except Exception as e:      # noqa: BLE001
+            last = e
+            _HIPS_COST[host] = _HIPS_DEAD   # dead or timing out: to the back of the queue
+            continue
+        c = _hips_cost(time.monotonic() - t0, mpx)
+        prev = _HIPS_COST.get(host)
+        # smoothed, so one unlucky request does not banish a host that is usually fine
+        _HIPS_COST[host] = c if prev is None or prev >= _HIPS_DEAD else 0.7 * prev + 0.3 * c
+        break
+    if data is None:
+        raise last or RuntimeError("no sky image server answered")
     try:
         tmp = cache + ".part"
         with open(tmp, "wb") as f:
             f.write(data)
         os.replace(tmp, cache)        # atomic: a killed thread never leaves a half file
-    except Exception:                 # noqa: BLE001
-        pass
+    except Exception as e:            # noqa: BLE001
+        # Not silently: a cache that cannot be written means every view is fetched
+        # again from Strasbourg, and that is exactly the failure that went unnoticed
+        # for months. Once per run is enough to say so.
+        global _SKY_CACHE_WARNED
+        if not _SKY_CACHE_WARNED:
+            _SKY_CACHE_WARNED = True
+            print("[NOUT] cannot write the sky cache ({}): every view will be "
+                  "downloaded again. {}".format(os.path.dirname(cache), e),
+                  file=sys.stderr, flush=True)
     return data
 
 
@@ -11473,6 +11582,15 @@ class MainWindow(QtWidgets.QMainWindow):
             self.sky_survey.addItem(label)
         self.sky_survey.setToolTip("Real sky survey shown behind the framing map "
                                    "(like Aladin). Needs Internet.")
+        # Remember the choice. It used to start on "None" every single time, so the
+        # background was simply absent at every launch until you went and picked a
+        # survey again — which reads as the background having stopped working.
+        try:
+            saved = QtCore.QSettings("NOUT", "NOUT").value("sky_survey", "DSS2 color", type=str)
+            i = [lab for lab, _h in self._SURVEYS].index(saved)
+        except ValueError:
+            i = 1                                   # DSS2 colour: the usual one
+        self.sky_survey.setCurrentIndex(i)
         self.sky_survey.currentIndexChanged.connect(self._on_survey_change)
         mbar.addWidget(self.sky_survey)
         self.sky_preload_btn = QtWidgets.QPushButton("⤓ Pre-load target (HD)")
@@ -11664,6 +11782,7 @@ class MainWindow(QtWidgets.QMainWindow):
         return self._SURVEYS[self.sky_survey.currentIndex()][1] if hasattr(self, "sky_survey") else ""
 
     def _on_survey_change(self, *args):
+        QtCore.QSettings("NOUT", "NOUT").setValue("sky_survey", self.sky_survey.currentText())
         if self._current_hips():
             self._schedule_bg()
         elif self.skymap:
@@ -11675,6 +11794,11 @@ class MainWindow(QtWidgets.QMainWindow):
             return
         if not self._current_hips() or self.skymap.mode != "framing":
             self.skymap.clear_background()
+            # Say why rather than just showing a bare map: survey imagery is only
+            # fetched for the framing view, and nothing said so.
+            if self._current_hips() and self.skymap.mode != "framing":
+                self.sky_status.setText(
+                    "Background: shown on the framing view \u2014 pick a target to frame.")
             return
         self._bg_timer.start()
 
@@ -12007,14 +12131,22 @@ class MainWindow(QtWidgets.QMainWindow):
             src = "session target"
         self.sky_image.setText("Loading… ({})".format(src))
         hips = self._current_hips() or "CDS/P/DSS2/color"
+        # Several of these can be in flight at once — a new solve, a new target, a
+        # click on the button. Without a serial the slowest reply wins and the panel
+        # ends up showing the field you were looking at two targets ago.
+        self._dso_seq = getattr(self, "_dso_seq", 0) + 1
+        seq = self._dso_seq
         self._dso_loader = DSOImageLoader(ra, dec, max(fw, 0.1),
                                           size=self.sky_image.width(), hips=hips)
-        self._dso_loader.done.connect(self._on_dso_image_done)
+        self._dso_loader.done.connect(
+            lambda data, err, _s=seq: self._on_dso_image_done(data, err, _s))
         self._track_thread(self._dso_loader)
         self._dso_loader.start()
 
     @Slot(object, str)
-    def _on_dso_image_done(self, data, err):
+    def _on_dso_image_done(self, data, err, seq=None):
+        if seq is not None and seq != getattr(self, "_dso_seq", seq):
+            return                       # a newer request has already been sent
         if data is None:
             self.sky_image.setText("Image unavailable\n(offline?)")
             self.sky_status.setText("Image fetch failed: {}".format(err)[:120])
