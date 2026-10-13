@@ -11582,14 +11582,16 @@ class MainWindow(QtWidgets.QMainWindow):
             self.sky_survey.addItem(label)
         self.sky_survey.setToolTip("Real sky survey shown behind the framing map "
                                    "(like Aladin). Needs Internet.")
-        # Remember the choice. It used to start on "None" every single time, so the
-        # background was simply absent at every launch until you went and picked a
-        # survey again — which reads as the background having stopped working.
+        # Remember the choice. It used to reset to "None" every single time, so the
+        # background was absent at every launch until you went and picked a survey
+        # again — which reads as the background having stopped working. Starting on
+        # "None" is still the default on a fresh install, so nothing is downloaded
+        # until you ask for it; it is the forgetting that was the problem.
         try:
-            saved = QtCore.QSettings("NOUT", "NOUT").value("sky_survey", "DSS2 color", type=str)
+            saved = QtCore.QSettings("NOUT", "NOUT").value("sky_survey", "None", type=str)
             i = [lab for lab, _h in self._SURVEYS].index(saved)
         except ValueError:
-            i = 1                                   # DSS2 colour: the usual one
+            i = 0
         self.sky_survey.setCurrentIndex(i)
         self.sky_survey.currentIndexChanged.connect(self._on_survey_change)
         mbar.addWidget(self.sky_survey)
