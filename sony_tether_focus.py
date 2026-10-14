@@ -5867,6 +5867,13 @@ class _Section(QtWidgets.QWidget):
         self.body = QtWidgets.QFrame(); self.body.setObjectName("secBody")
         self.lay = QtWidgets.QVBoxLayout(self.body)
         self.lay.setContentsMargins(10, 8, 10, 8); self.lay.setSpacing(5)
+        # Never taller than it needs to be. Left on the default policy a folded
+        # section still took the space it had when it was open — 138 px of nothing
+        # under "Exposure" — and the leftover had to come from somewhere, so the
+        # sections at the bottom were squeezed to 8 px and their titles came out cut
+        # in half. Spare height belongs to the stretch at the end of the column.
+        self.setSizePolicy(QtWidgets.QSizePolicy.Policy.Expanding,
+                           QtWidgets.QSizePolicy.Policy.Maximum)
         v.addWidget(self.head); v.addWidget(self.body)
         self.head.toggled.connect(self._apply)
         self._apply(expanded, emit=False)
@@ -5874,6 +5881,7 @@ class _Section(QtWidgets.QWidget):
     def _apply(self, on, emit=True):
         self.head.setText(("▾   " if on else "▸   ") + self._title)
         self.body.setVisible(on)
+        self.updateGeometry()           # the hint just changed; say so
         if emit:
             self.expandedChanged.emit(self, on)
 
@@ -5950,6 +5958,7 @@ class _SectionColumn(QtWidgets.QScrollArea):
         for _ in range(len(self._secs)):
             if self._need() <= avail:
                 self._w.setMinimumHeight(0)       # it all fits: no scroll bar wanted
+                self._relayout()
                 return
             # fold the least important first (sticky sections last), oldest first
             victims = sorted((s for s in self._order if s is not keep),
@@ -5967,6 +5976,28 @@ class _SectionColumn(QtWidgets.QScrollArea):
         # the content is cut off mid-control, which is what Framing / Mosaic did. A
         # scroll bar for that one case is far better than a broken panel.
         self._w.setMinimumHeight(self._need())
+        self._relayout()
+
+    def _relayout(self):
+        """Fold and unfold change every section's wanted height, and a layout that is
+        not told re-uses the geometry from before — which is how a folded section kept
+        the room it had when it was open, and how Framing / Mosaic opened 30 px short
+        of its own content with 236 px of the panel standing empty.
+
+        Every level has to be invalidated, not just the column: the column asks each
+        section for its height, the section asks its body, and a stale answer anywhere
+        down that chain is the one that gets used."""
+        for sec in self._secs:
+            for lay in (sec.body.layout(), sec.layout()):
+                if lay is not None:
+                    lay.invalidate()
+            sec.body.updateGeometry()
+            sec.updateGeometry()
+        lay = self._w.layout()
+        if lay is not None:
+            lay.invalidate()
+            lay.activate()
+        self._w.updateGeometry()
 
     def _reopen(self):
         """Give back what fit() folded, most recent first, as long as it fits."""
@@ -6000,6 +6031,7 @@ class _SectionColumn(QtWidgets.QScrollArea):
     def _refit(self):
         self.fit(self._order[-1] if self._order else None)
         self._reopen()
+        self._relayout()
 
 
 class _NutBanner(QtWidgets.QWidget):
@@ -9820,8 +9852,9 @@ class MainWindow(QtWidgets.QMainWindow):
         self.sat_slider.valueChanged.connect(self._restretch)
         srow.addWidget(QtWidgets.QLabel("saturation")); srow.addWidget(self.sat_slider)
         rl.addLayout(srow)
-        drow = QtWidgets.QHBoxLayout()
-        drow.addWidget(QtWidgets.QLabel("detail"))
+        # Created here with its neighbours, but placed by the visible panel further
+        # down (sp.row): everything in this tool box is hidden, and a control added
+        # only here is one nobody can reach.
         self.obs_smooth = QtWidgets.QComboBox()
         for lab, val in (("Sharp", 0.35), ("Balanced", 0.60), ("Smooth (faintest)", 1.00)):
             self.obs_smooth.addItem(lab, val)
@@ -9836,8 +9869,6 @@ class MainWindow(QtWidgets.QMainWindow):
             max(0, self.obs_smooth.findText(
                 QtCore.QSettings("NOUT", "NOUT").value("obs_smooth", "Balanced", type=str))))
         self.obs_smooth.currentIndexChanged.connect(self._on_smooth_change)
-        drow.addWidget(self.obs_smooth); drow.addStretch(1)
-        rl.addLayout(drow)
         self.chk_cull = QtWidgets.QCheckBox("Discard bad exposures (→ rejected/)")
         self.chk_cull.setToolTip("Moves to rejected/ the shots where star count drops.")
         self.chk_cull.toggled.connect(lambda on: self.worker.post("set_cull", on=on))
@@ -10210,6 +10241,7 @@ class MainWindow(QtWidgets.QMainWindow):
         pg_.setColumnStretch(0, 1); pg_.setColumnStretch(1, 1)
         sp.lay.addLayout(pg_)
         sp.row("Saturation", self.sat_slider)
+        sp.row("Detail", self.obs_smooth, None)
         self.sat_slider.setSizePolicy(QtWidgets.QSizePolicy.Expanding,
                                       QtWidgets.QSizePolicy.Fixed)
         # checkbox + its values on one line, in a 4-column grid so nothing overlaps
